@@ -405,6 +405,162 @@
     }
    }
   },
+  "/empresas/{empresa_id}/logo": {
+   "get": {
+    "tags": [
+     "empresas"
+    ],
+    "summary": "Logo de la empresa (PNG)",
+    "operationId": "ver_logo_empresas__empresa_id__logo_get",
+    "parameters": [
+     {
+      "name": "empresa_id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string",
+       "format": "uuid",
+       "title": "Empresa Id"
+      }
+     },
+     {
+      "name": "authorization",
+      "in": "header",
+      "required": false,
+      "schema": {
+       "type": "string",
+       "default": "",
+       "title": "Authorization"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "Successful Response"
+     },
+     "404": {
+      "description": "La empresa no tiene logo"
+     },
+     "422": {
+      "description": "Validation Error",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      }
+     }
+    }
+   },
+   "put": {
+    "tags": [
+     "empresas"
+    ],
+    "summary": "Subir o cambiar el logo (sale en boletas, constancias y reportes)",
+    "operationId": "subir_logo_empresas__empresa_id__logo_put",
+    "parameters": [
+     {
+      "name": "empresa_id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string",
+       "format": "uuid",
+       "title": "Empresa Id"
+      }
+     },
+     {
+      "name": "authorization",
+      "in": "header",
+      "required": false,
+      "schema": {
+       "type": "string",
+       "default": "",
+       "title": "Authorization"
+      }
+     }
+    ],
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/LogoIn"
+       }
+      }
+     }
+    },
+    "responses": {
+     "200": {
+      "description": "Successful Response",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "additionalProperties": true,
+         "title": "Response Subir Logo Empresas  Empresa Id  Logo Put"
+        }
+       }
+      }
+     },
+     "422": {
+      "description": "Validation Error",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      }
+     }
+    }
+   },
+   "delete": {
+    "tags": [
+     "empresas"
+    ],
+    "summary": "Quitar el logo",
+    "operationId": "quitar_logo_empresas__empresa_id__logo_delete",
+    "parameters": [
+     {
+      "name": "empresa_id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string",
+       "format": "uuid",
+       "title": "Empresa Id"
+      }
+     },
+     {
+      "name": "authorization",
+      "in": "header",
+      "required": false,
+      "schema": {
+       "type": "string",
+       "default": "",
+       "title": "Authorization"
+      }
+     }
+    ],
+    "responses": {
+     "204": {
+      "description": "Successful Response"
+     },
+     "422": {
+      "description": "Validation Error",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
   "/empresas/{empresa_id}/configuracion": {
    "get": {
     "tags": [
@@ -22791,6 +22947,23 @@
      "motivo"
     ],
     "title": "LiquidacionIn"
+   },
+   "LogoIn": {
+    "properties": {
+     "datos_base64": {
+      "type": "string",
+      "maxLength": 2800000,
+      "minLength": 8,
+      "title": "Datos Base64"
+     }
+    },
+    "additionalProperties": false,
+    "type": "object",
+    "required": [
+     "datos_base64"
+    ],
+    "title": "LogoIn",
+    "description": "Imagen PNG o JPG en base64 (máx. 2 MB). La API la reduce a 600 px y la guarda como PNG."
    },
    "MarcaIn": {
     "properties": {

@@ -584,4 +584,4 @@ def exportar(tipo: Literal["diario", "mayor", "comprobacion", "resultados", "bal
                          C("debito", "Débito", "dinero"), C("credito", "Crédito", "dinero")], filas, sumar=[])
         rep["totales"] = {"debito": di["totales"]["debitos"], "credito": di["totales"]["creditos"]}
         nombre = f"libro-diario-{d}-{h}"
-    return R.entregar(rep, formato, nombre)
+    return R.entregar(rep, formato, nombre, ctx)

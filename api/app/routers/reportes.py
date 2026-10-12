@@ -43,7 +43,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from .. import crud
 from ..auth import Contexto, contexto_empresa, operador, requiere_modulo
 from ..fechas import hoy_cr
-from ..servicios import pdf
+from ..servicios import marca, pdf
 
 r = APIRouter(prefix="/empresas/{empresa_id}", tags=["reportes"], dependencies=[Depends(requiere_modulo("planilla"))])
 
@@ -292,7 +292,7 @@ def a_xlsx(rep: dict, nombre_hoja: str = "Reporte") -> bytes:
     return buf.getvalue()
 
 
-def a_pdf(rep: dict) -> bytes:
+def a_pdf(rep: dict, logo: bytes | None = None) -> bytes:
     cols = rep["columnas"]
     derecha = {i for i, c in enumerate(cols) if c["tipo"] in ("dinero", "numero", "porcentaje")}
     filas = [[_celda_txt(fl.get(c["clave"]), c["tipo"]) for c in cols] for fl in rep["filas"]]
@@ -301,14 +301,15 @@ def a_pdf(rep: dict) -> bytes:
         total = ["Totales"] + [_celda_txt(rep["totales"].get(c["clave"]), c["tipo"]) if c["clave"] in rep["totales"]
                                else "" for c in cols[1:]]
     return pdf.reporte_tabla(rep["titulo"], rep["subtitulo"], [c["titulo"] for c in cols], filas, derecha, total,
-                             " ".join(rep.get("notas", [])))
+                             " ".join(rep.get("notas", [])), logo=logo)
 
 
-def entregar(rep: dict, formato: str, nombre: str):
+def entregar(rep: dict, formato: str, nombre: str, ctx: Contexto | None = None):
     if formato == "xlsx":
         return archivo(a_xlsx(rep, rep["titulo"]), f"{nombre}.xlsx", XLSX)
     if formato == "pdf":
-        return archivo(a_pdf(rep), f"{nombre}.pdf", "application/pdf")
+        logo = marca.logo(ctx.conn, ctx.empresa_id) if ctx else None
+        return archivo(a_pdf(rep, logo), f"{nombre}.pdf", "application/pdf")
     return a_json(rep)
 
 
@@ -686,7 +687,7 @@ def generar_reporte(tipo: str, desde: date | None = None, hasta: date | None = N
         raise HTTPException(404, f"Reporte desconocido: {tipo}")
     f = filtros(desde, hasta, planilla_id, sucursal_id, empleado_id)
     rep = REPORTES[tipo][3](ctx, f)
-    return entregar(rep, formato, f"{tipo}-{f.desde}-{f.hasta}")
+    return entregar(rep, formato, f"{tipo}-{f.desde}-{f.hasta}", ctx)
 
 
 # =============================================================================
@@ -1208,7 +1209,7 @@ def exportar_asiento(id: UUID, formato: Literal["csv", "xlsx", "pdf"] = "csv",
     if formato == "xlsx":
         return archivo(a_xlsx(rep, "Asiento"), f"{nombre}.xlsx", XLSX)
     if formato == "pdf":
-        return archivo(a_pdf(rep), f"{nombre}.pdf", "application/pdf")
+        return archivo(a_pdf(rep, marca.logo(ctx.conn, ctx.empresa_id)), f"{nombre}.pdf", "application/pdf")
     out = io.StringIO()
     w = csv.writer(out, lineterminator="\r\n")
     w.writerow([c["titulo"] for c in cols])

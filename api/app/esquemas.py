@@ -44,6 +44,11 @@ class CambioModuloIn(Base):
     activo: bool
 
 
+class LogoIn(Base):
+    """Imagen PNG o JPG en base64 (máx. 2 MB). La API la reduce a 600 px y la guarda como PNG."""
+    datos_base64: str = Field(min_length=8, max_length=2_800_000)
+
+
 class ConfiguracionIn(Base):
     metodo_renta: Literal["per_period", "monthly_consolidated"] | None = None
     base_renta: Literal["gross", "net_ccss"] | None = None

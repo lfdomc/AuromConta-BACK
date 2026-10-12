@@ -9,7 +9,7 @@ from psycopg import sql
 from .. import crud
 from ..auth import Contexto, aprobador, contexto_empresa, operador, requiere_modulo
 from ..esquemas import EnviarIn, PlanillaIn, ReabrirIn
-from ..servicios import calculo, cierre, correo, pdf
+from ..servicios import calculo, cierre, correo, marca, pdf
 
 r = APIRouter(prefix="/empresas/{empresa_id}/planillas", tags=["planillas"], dependencies=[Depends(requiere_modulo("planilla"))])
 
@@ -197,7 +197,8 @@ def _pdf_boleta(conn, empresa_id, planilla: dict, boleta: dict) -> bytes:
     empleado = conn.execute("select * from empleados where id = %s", (boleta["empleado_id"],)).fetchone()
     lineas = conn.execute("select * from boleta_lineas where boleta_id = %s order by orden", (boleta["id"],)).fetchall()
     nota = conn.execute("select nota_boleta from configuracion_planilla where empresa_id = %s", (empresa_id,)).fetchone()
-    return pdf.boleta_pdf(empresa, planilla, empleado, boleta, lineas, nota["nota_boleta"] if nota else None)
+    return pdf.boleta_pdf(empresa, planilla, empleado, boleta, lineas, nota["nota_boleta"] if nota else None,
+                          logo=marca.logo(conn, empresa_id))
 
 
 @r.get("/{id}/boletas/{boleta_id}/pdf", response_class=Response)

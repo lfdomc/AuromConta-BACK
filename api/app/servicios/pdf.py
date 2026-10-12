@@ -12,7 +12,14 @@ from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import mm
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+from reportlab.platypus import (
+    Image,
+    Paragraph,
+    SimpleDocTemplate,
+    Spacer,
+    Table,
+    TableStyle,
+)
 
 _F = pathlib.Path(__file__).resolve().parents[1] / "fuentes"
 pdfmetrics.registerFont(TTFont("DejaVu", str(_F / "DejaVuSans.ttf")))
@@ -29,6 +36,60 @@ TIT = ParagraphStyle("tit", parent=_ss["Title"], fontName="DejaVu-Bold", fontSiz
 SUB = ParagraphStyle("sub", parent=_ss["Normal"], fontName="DejaVu", fontSize=9, textColor=GRIS)
 NOR = ParagraphStyle("nor", parent=_ss["Normal"], fontName="DejaVu", fontSize=9, leading=12)
 H2 = ParagraphStyle("h2", parent=_ss["Heading2"], fontName="DejaVu-Bold", fontSize=11, textColor=AZUL, spaceBefore=8, spaceAfter=4)
+
+
+LOGO_MAX_ALTO = 18 * mm
+LOGO_MAX_ANCHO = 48 * mm
+
+
+def normalizar_logo(datos: bytes, max_px: int = 600) -> bytes:
+    """Valida que sea una imagen PNG o JPEG real y la reescribe como PNG de máximo `max_px` de lado.
+    Reescribirla descarta metadatos y cualquier contenido que no sea la imagen."""
+    from PIL import Image as PILImage
+
+    if not datos.startswith((b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff")):
+        raise ValueError("El logo debe ser una imagen PNG o JPG")
+    PILImage.MAX_IMAGE_PIXELS = 25_000_000
+    try:
+        with PILImage.open(io.BytesIO(datos)) as im:
+            im.load()
+            if im.mode not in ("RGB", "RGBA"):
+                im = im.convert("RGBA")
+            im.thumbnail((max_px, max_px))
+            salida = io.BytesIO()
+            im.save(salida, format="PNG", optimize=True)
+            return salida.getvalue()
+    except ValueError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - Pillow lanza varios tipos según el formato dañado
+        raise ValueError("No se pudo leer la imagen del logo") from exc
+
+
+def _logo(datos: bytes | None):
+    """Imagen del logo escalada para el encabezado, o None si no hay o no se puede leer."""
+    if not datos:
+        return None
+    try:
+        from reportlab.lib.utils import ImageReader
+
+        ancho, alto = ImageReader(io.BytesIO(datos)).getSize()
+        escala = min(LOGO_MAX_ALTO / alto, LOGO_MAX_ANCHO / ancho)
+        return Image(io.BytesIO(datos), width=ancho * escala, height=alto * escala)
+    except Exception:  # noqa: BLE001 - un logo dañado nunca impide generar el documento
+        return None
+
+
+def encabezado(titulo: str, subtitulo: str, logo: bytes | None, ancho: float) -> list:
+    """Título y subtítulo; con logo, el logo va a la izquierda y el texto a su lado."""
+    textos = [Paragraph(titulo, TIT), Paragraph(subtitulo, SUB)]
+    img = _logo(logo)
+    if img is None:
+        return [*textos, Spacer(1, 6)]
+    t = Table([[img, textos]], colWidths=[img.drawWidth + 5 * mm, ancho - img.drawWidth - 5 * mm])
+    t.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "MIDDLE"), ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                           ("RIGHTPADDING", (0, 0), (-1, -1), 0), ("TOPPADDING", (0, 0), (-1, -1), 0),
+                           ("BOTTOMPADDING", (0, 0), (-1, -1), 0)]))
+    return [t, Spacer(1, 8)]
 
 
 def colones(v) -> str:
@@ -55,13 +116,14 @@ def _tabla(filas, anchos, total=False):
     return t
 
 
-def boleta_pdf(empresa: dict, planilla: dict, empleado: dict, boleta: dict, lineas: list[dict], nota: str | None = None) -> bytes:
+def boleta_pdf(empresa: dict, planilla: dict, empleado: dict, boleta: dict, lineas: list[dict], nota: str | None = None,
+               logo: bytes | None = None) -> bytes:
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=LETTER, leftMargin=18 * mm, rightMargin=18 * mm, topMargin=16 * mm,
                             bottomMargin=16 * mm, title="Boleta de pago")
     nombre = f"{empleado['nombre']} {empleado.get('apellidos') or ''}".strip()
-    el = [Paragraph(empresa["nombre"], TIT),
-          Paragraph(f"Cédula jurídica {empresa.get('cedula_juridica') or '—'} · Boleta de pago", SUB), Spacer(1, 6)]
+    el = encabezado(empresa["nombre"], f"Cédula jurídica {empresa.get('cedula_juridica') or '—'} · Boleta de pago",
+                    logo, 173 * mm)
     info = [["Colaborador", nombre, "Periodo", f"{fecha(planilla['desde'])} al {fecha(planilla['hasta'])}"],
             ["Identificación", empleado["identificacion"], "Fecha de pago", fecha(planilla.get("fecha_pago"))],
             ["Puesto", empleado.get("puesto") or "", "Salario mensual", colones(empleado.get("salario_mensual"))]]
@@ -102,13 +164,14 @@ def boleta_pdf(empresa: dict, planilla: dict, empleado: dict, boleta: dict, line
     return buf.getvalue()
 
 
-def documento_simple(titulo: str, subtitulo: str, secciones: list[tuple[str, list[list[str]]]], pie: str = "") -> bytes:
+def documento_simple(titulo: str, subtitulo: str, secciones: list[tuple[str, list[list[str]]]], pie: str = "",
+                     logo: bytes | None = None) -> bytes:
     """PDF genérico: título + tablas de dos o más columnas (liquidaciones, constancias, reportes)."""
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=LETTER, leftMargin=18 * mm, rightMargin=18 * mm, topMargin=16 * mm,
                             bottomMargin=16 * mm, title=titulo)
-    el = [Paragraph(titulo, TIT), Paragraph(subtitulo, SUB), Spacer(1, 6)]
     ancho = 173 * mm
+    el = encabezado(titulo, subtitulo, logo, ancho)
     for nombre, filas in secciones:
         if nombre:
             el.append(Paragraph(nombre, H2))
@@ -123,7 +186,8 @@ def documento_simple(titulo: str, subtitulo: str, secciones: list[tuple[str, lis
 
 
 def reporte_tabla(titulo: str, subtitulo: str, encabezados: list[str], filas: list[list[str]],
-                  derecha: set[int] | None = None, total: list[str] | None = None, pie: str = "") -> bytes:
+                  derecha: set[int] | None = None, total: list[str] | None = None, pie: str = "",
+                  logo: bytes | None = None) -> bytes:
     """PDF de un reporte tabular (Fase 4). Hoja horizontal con más de 6 columnas; el ancho de
     cada columna sale de su contenido y el tamaño de letra se ajusta para que todo quepa."""
     from reportlab.lib.pagesizes import landscape
@@ -180,7 +244,7 @@ def reporte_tabla(titulo: str, subtitulo: str, encabezados: list[str], filas: li
     if total:
         estilo.append(("LINEABOVE", (0, -1), (-1, -1), 0.6, GRIS))
     t.setStyle(TableStyle(estilo))
-    el = [Paragraph(titulo, TIT), Paragraph(subtitulo, SUB), Spacer(1, 6), t]
+    el = [*encabezado(titulo, subtitulo, logo, ancho), t]
     if not filas:
         el.append(Paragraph("Sin datos para los filtros seleccionados.", NOR))
     el += [Spacer(1, 8), Paragraph(pie or "Generado con Planilla Costa Rica · auromtec.com", SUB)]

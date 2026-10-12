@@ -29,7 +29,7 @@ from ..auth import (
 from ..config import cabeceras_admin_supabase, settings
 from ..db import Conexion
 from ..fechas import hoy_cr
-from ..servicios import facturacion, pdf
+from ..servicios import facturacion, marca, pdf
 
 r = APIRouter(prefix="/plataforma", tags=["plataforma"])
 invitar = APIRouter(tags=["portal"])
@@ -574,7 +574,8 @@ def mi_boleta_pdf(id: UUID, u: Usuario = Depends(usuario_actual), conn: Conexion
     lineas = conn.execute("select * from boleta_lineas where boleta_id = %s order by orden", (id,)).fetchall()
     empresa = {"nombre": pl["empresa_nombre"], "cedula_juridica": pl["cedula_juridica"]}
     planilla = {"desde": pl["desde"], "hasta": pl["hasta"], "fecha_pago": pl["fecha_pago"]}
-    contenido = pdf.boleta_pdf(empresa, planilla, empleado, b, lineas, pl["nota_boleta"])
+    contenido = pdf.boleta_pdf(empresa, planilla, empleado, b, lineas, pl["nota_boleta"],
+                               logo=marca.logo(conn, b["empresa_id"]))
     return Response(contenido, media_type="application/pdf",
                     headers={"Content-Disposition": f'inline; filename="boleta-{pl["hasta"]}.pdf"'})
 

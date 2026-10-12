@@ -1,9 +1,12 @@
 """Sesión, empresas, usuarios, contadores asignados, configuración y catálogos."""
+import base64
+import binascii
 from uuid import UUID
 
 import httpx
 import psycopg
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import Response
 from psycopg import sql
 
 from .. import crud
@@ -25,12 +28,14 @@ from ..esquemas import (
     EmpresaIn,
     FeriadoIn,
     HorarioIn,
+    LogoIn,
     ModuloCodigo,
     NuevaEmpresa,
     SucursalIn,
     UsuarioEmpresaIn,
     UsuarioEmpresaUpd,
 )
+from ..servicios import marca, pdf
 
 r = APIRouter(tags=["empresas"])
 
@@ -88,6 +93,39 @@ def cambiar_modulo(modulo: ModuloCodigo, datos: CambioModuloIn, ctx: Contexto = 
 @r.patch("/empresas/{empresa_id}")
 def editar_empresa(datos: EmpresaIn, ctx: Contexto = Depends(admin_empresa)) -> dict:
     return crud.actualizar(ctx.conn, "empresas", ctx.empresa_id, datos.model_dump(exclude_unset=True))
+
+
+@r.get("/empresas/{empresa_id}/logo", response_class=Response, summary="Logo de la empresa (PNG)",
+       responses={404: {"description": "La empresa no tiene logo"}})
+def ver_logo(ctx: Contexto = Depends(contexto_empresa)) -> Response:
+    datos = marca.logo(ctx.conn, ctx.empresa_id)
+    if not datos:
+        raise HTTPException(404, "La empresa no tiene logo")
+    return Response(datos, media_type="image/png", headers={"Cache-Control": "private, no-cache"})
+
+
+@r.put("/empresas/{empresa_id}/logo", summary="Subir o cambiar el logo (sale en boletas, constancias y reportes)")
+def subir_logo(datos: LogoIn, ctx: Contexto = Depends(admin_empresa)) -> dict:
+    texto = datos.datos_base64.split(",", 1)[-1]          # acepta también "data:image/png;base64,..."
+    try:
+        crudo = base64.b64decode(texto, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise HTTPException(422, "El archivo no se pudo leer") from exc
+    if len(crudo) > 2 * 1024 * 1024:
+        raise HTTPException(422, "El logo pesa más de 2 MB")
+    try:
+        png = pdf.normalizar_logo(crudo)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    ctx.conn.execute("""insert into empresa_logos (empresa_id, tipo, datos) values (%s, 'image/png', %s)
+                        on conflict (empresa_id) do update set tipo = excluded.tipo, datos = excluded.datos,
+                                                               actualizado_en = now()""", (ctx.empresa_id, png))
+    return {"ok": True, "bytes": len(png)}
+
+
+@r.delete("/empresas/{empresa_id}/logo", status_code=204, summary="Quitar el logo")
+def quitar_logo(ctx: Contexto = Depends(admin_empresa)) -> None:
+    ctx.conn.execute("delete from empresa_logos where empresa_id = %s", (ctx.empresa_id,))
 
 
 @r.get("/empresas/{empresa_id}/configuracion")

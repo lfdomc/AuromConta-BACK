@@ -12,7 +12,7 @@ from .. import crud
 from ..auth import Contexto, aprobador, contexto_empresa, operador, requiere_modulo
 from ..esquemas import AguinaldoIn, LiquidacionIn
 from ..fechas import hoy_cr
-from ..servicios import pdf
+from ..servicios import marca, pdf
 
 r = APIRouter(prefix="/empresas/{empresa_id}", tags=["anuales"], dependencies=[Depends(requiere_modulo("planilla"))])
 
@@ -192,7 +192,7 @@ def liquidacion_pdf(id: UUID, ctx: Contexto = Depends(contexto_empresa)) -> Resp
     pie = " ".join(res.get("notas", [])) + "  Recibí conforme: ______________________   Fecha: ____________"
     contenido = pdf.documento_simple(f"Liquidación laboral · {emp['nombre']}",
                                      f"Cédula jurídica {emp['cedula_juridica'] or '—'} · Código de Trabajo Arts. 28-31",
-                                     secciones, pie)
+                                     secciones, pie, logo=marca.logo(ctx.conn, ctx.empresa_id))
     return Response(contenido, media_type="application/pdf",
                     headers={"Content-Disposition": f'inline; filename="liquidacion-{e["identificacion"]}.pdf"'})
 
@@ -208,6 +208,7 @@ def constancia(id: UUID, ctx: Contexto = Depends(contexto_empresa)) -> Response:
              f"{e['puesto'] or 'colaborador(a)'}. Motivo de la terminación: {MOTIVOS[l['motivo']].lower()}. "
              f"Se extiende la presente a solicitud de la persona interesada el {pdf.fecha(hoy_cr())}.")
     contenido = pdf.documento_simple("Constancia laboral", emp["nombre"], [], texto +
-                                     "<br/><br/><br/>______________________________<br/>Firma y sello")
+                                     "<br/><br/><br/>______________________________<br/>Firma y sello",
+                                     logo=marca.logo(ctx.conn, ctx.empresa_id))
     return Response(contenido, media_type="application/pdf",
                     headers={"Content-Disposition": f'inline; filename="constancia-{e["identificacion"]}.pdf"'})

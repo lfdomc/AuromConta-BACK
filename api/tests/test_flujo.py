@@ -206,3 +206,41 @@ def test_periodo_y_calendario_coherentes(client, usuarios, empresa, empleados):
     r = client.patch(f"/empresas/{empresa}/empleados/{empleados['ana']}", json={"calendario_id": cal.json()["id"]},
                      headers=op)
     assert r.status_code == 422 and "quincenal" in r.json()["detail"]
+
+
+def _png(color=(200, 30, 30)) -> str:
+    import base64
+    import io as _io
+
+    from PIL import Image as _Img
+    b = _io.BytesIO()
+    _Img.new("RGB", (900, 300), color).save(b, format="PNG")
+    return base64.b64encode(b.getvalue()).decode()
+
+
+def test_logo_empresa_en_pdfs(client, usuarios, empresa, empleados, planilla):
+    a, op, otro = usuarios["admin"]["h"], usuarios["operador"]["h"], usuarios["otro"]["h"]
+    assert client.get(f"/empresas/{empresa}/logo", headers=a).status_code == 404
+    # Solo el administrador de la empresa lo cambia; se valida que sea imagen real
+    assert client.put(f"/empresas/{empresa}/logo", json={"datos_base64": _png()}, headers=op).status_code == 403
+    r = client.put(f"/empresas/{empresa}/logo", json={"datos_base64": "data:image/png;base64,QUJDREVGR0g="}, headers=a)
+    assert r.status_code == 422 and "PNG o JPG" in r.json()["detail"]
+    r = client.put(f"/empresas/{empresa}/logo", json={"datos_base64": "data:image/png;base64," + _png()}, headers=a)
+    assert r.status_code == 200, r.text
+    g = client.get(f"/empresas/{empresa}/logo", headers=op)
+    assert g.status_code == 200 and g.headers["content-type"] == "image/png" and g.content.startswith(b"\x89PNG")
+    from PIL import Image as _Img
+    import io as _io
+    assert max(_Img.open(_io.BytesIO(g.content)).size) == 600          # reducido a 600 px
+    assert client.get(f"/empresas/{empresa}/logo", headers=otro).status_code == 404   # otra empresa no lo ve
+    # La boleta en PDF lleva la imagen
+    client.post(f"/empresas/{empresa}/planillas/{planilla['id']}/calcular", headers=op)
+    bol = client.get(f"/empresas/{empresa}/planillas/{planilla['id']}", headers=op).json()["boletas"][0]
+    p = client.get(f"/empresas/{empresa}/planillas/{planilla['id']}/boletas/{bol['id']}/pdf", headers=op)
+    assert p.status_code == 200 and b"/Subtype /Image" in p.content
+    # Reporte en PDF también
+    rep = client.get(f"/empresas/{empresa}/reportes/ccss?formato=pdf&planilla_id={planilla['id']}", headers=op)
+    assert rep.status_code == 200 and b"/Subtype /Image" in rep.content, rep.text[:200]
+    assert client.delete(f"/empresas/{empresa}/logo", headers=a).status_code == 204
+    p = client.get(f"/empresas/{empresa}/planillas/{planilla['id']}/boletas/{bol['id']}/pdf", headers=op)
+    assert p.status_code == 200 and b"/Subtype /Image" not in p.content
