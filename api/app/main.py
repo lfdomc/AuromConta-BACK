@@ -61,6 +61,7 @@ MODULOS = [
     "novedades",      # Fase 2
     "anuales",        # Fase 3: aguinaldo y liquidaciones
     "reportes",       # Fase 4: reportes, exportaciones, asientos, dashboard
+    "machote",        # Machote completo de importación (como el del módulo Odoo); antes de /importaciones/{tipo}
     "importaciones",  # Fase 5: importadores Excel y migración desde Odoo
     "saas",           # Fase 6: alta, portal del empleado, panel de plataforma
     "negocio",        # Fase 7: facturación electrónica, cobros, gastos, IVA, renta
@@ -97,9 +98,20 @@ async def error_referencia(request: Request, exc: Exception):
                         status_code=409)
 
 
+# Mensajes claros para los duplicados de identificación (migración 0018).
+DUPLICADOS = {
+    "empresas_cedula_unica": "Ya existe una empresa con esa cédula jurídica. Si es la suya, pida acceso a quien la "
+                             "administra o escriba a soporte de A.U.R.O.M.",
+    "empleados_identificacion_unica": "Ya existe un colaborador con esa identificación en esta empresa.",
+    "empleados_empresa_id_identificacion_key": "Ya existe un colaborador con esa identificación en esta empresa.",
+    "clientes_identificacion_unica": "Ya existe un cliente con esa identificación.",
+}
+
+
 @app.exception_handler(psycopg.errors.UniqueViolation)
 async def error_duplicado(request: Request, exc: Exception):
-    return JSONResponse({"detail": "Ya existe un registro con esos datos"}, status_code=409)
+    restriccion = getattr(getattr(exc, "diag", None), "constraint_name", None) or ""
+    return JSONResponse({"detail": DUPLICADOS.get(restriccion, "Ya existe un registro con esos datos")}, status_code=409)
 
 
 @app.exception_handler(psycopg.errors.CheckViolation)

@@ -147,7 +147,7 @@ def boletas_de(ctx: Contexto, planillas: list[dict], f: Filtros | None = None) -
     q = sql.SQL("""select b.*, e.identificacion, e.tipo_identificacion, e.nombre, e.apellidos, e.fecha_ingreso,
                   e.sucursal_id as emp_sucursal_id, coalesce(s.nombre, 'Sin sucursal') as sucursal,
                   e.iban, e.banco, e.telefono, e.correo, e.clase_riesgo_ins as emp_clase, e.medio_tiempo,
-                  e.por_asistencia, e.puesto, e.hijos, e.conyuge, h.jornada,
+                  e.por_asistencia, e.puesto, e.hijos, e.conyuge, e.asegurado_ccss, e.numero_ccss, h.jornada,
                   p.desde as p_desde, p.hasta as p_hasta, p.tipo as p_tipo, p.estado as p_estado,
                   p.fecha_pago as p_fecha_pago
              from boletas b join planillas p on p.id = b.planilla_id
@@ -345,6 +345,8 @@ def rep_ccss(ctx: Contexto, f: Filtros) -> dict:
     pls = planillas_reporte(ctx, f, TIPOS_COTIZABLES)
     filas = []
     for x in por_empleado(boletas_de(ctx, pls, f), ["base_cotizable", "base_ccss", "ccss_obrero", "ccss_patronal"]):
+        if x.get("asegurado_ccss") is False:      # no asegurados no se reportan a la CCSS (planilla SP de Odoo)
+            continue
         filas.append({**x, "empleado": nombre_completo(x), "total_cuota": x["ccss_obrero"] + x["ccss_patronal"]})
     par = parametros_vigentes(ctx, f.hasta)
     tasas = (f"Tasa obrero {dec(par.get('ccss_obrero', 0)) * 100:.2f} % · tasa patronal "
@@ -1134,7 +1136,7 @@ _BANCOS: dict[str, Callable[[_PagoBanco], Response]] = {
 def exportar_banco(planilla_id: UUID, formato: Literal["csv", "xlsx"] = "csv", banco: BANCOS = "generico",
                    concepto: str | None = None, cliente_bncr: str | None = None, transferencia: str | None = None,
                    iban_debito: str | None = None, moneda: Literal["01", "02"] = "01", plan_bac: str | None = None,
-                   envio: int = Query(1, ge=1, le=99999), ctx: Contexto = Depends(contexto_empresa)) -> Response:
+                   envio: int | None = Query(None, ge=1, le=99999), ctx: Contexto = Depends(contexto_empresa)) -> Response:
     """Formatos de models/bank_payment.py. El monto es el neto de la boleta (lo que deposita
     el patrono). `banco`: generico (CSV/XLSX propio de Aurom), bcr (BCR DAV CSV), bncr
     (BNCR SINPE .SIN, requiere cliente_bncr, transferencia, iban_debito), sinpe (SINPE Móvil
@@ -1147,9 +1149,20 @@ def exportar_banco(planilla_id: UUID, formato: Literal["csv", "xlsx"] = "csv", b
         raise HTTPException(409, "La planilla no tiene boletas")
     bols.sort(key=lambda b: nombre_completo(b))
     sufijo = f"{pl['desde']}_{pl['hasta']}"
+    cfg = ctx.conn.execute("select bac_plan, bac_envio, bac_concepto from configuracion_planilla where empresa_id = %s",
+                           (ctx.empresa_id,)).fetchone() or {}
+    if banco == "bac_prn":
+        # BAC Formato 6: plan, número de envío y concepto salen de Configuración › Planilla si no se indican.
+        plan_bac = plan_bac or cfg.get("bac_plan")
+        concepto = concepto or cfg.get("bac_concepto")
+        envio = envio or cfg.get("bac_envio") or 1
     p = _PagoBanco(ctx, pl, bols, sufijo, [], formato, concepto, cliente_bncr, transferencia, iban_debito, moneda,
-                   plan_bac, envio)
-    return _BANCOS[banco](p)
+                   plan_bac, envio or 1)
+    resp = _BANCOS[banco](p)
+    if banco == "bac_prn" and cfg:
+        # El número de envío avanza solo, como en el módulo Odoo.
+        ctx.conn.execute("select public.avanzar_envio_bac(%s, %s)", (ctx.empresa_id, envio))
+    return resp
 
 
 # =============================================================================

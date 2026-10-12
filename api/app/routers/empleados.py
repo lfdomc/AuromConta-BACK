@@ -23,6 +23,12 @@ from ..fechas import hoy_cr
 NOMBRE_FRECUENCIA = {"monthly": "mensual", "biweekly": "quincenal", "weekly": "semanal", "bimonthly": "bimensual"}
 
 
+def _validar_tipo(ctx: Contexto, codigo: str | None) -> None:
+    if codigo and not ctx.conn.execute("select 1 from tipos_empleado where empresa_id = %s and codigo = %s",
+                                       (ctx.empresa_id, codigo)).fetchone():
+        raise HTTPException(422, f"No existe el tipo de colaborador «{codigo}» (Configuración › Tipos de colaborador)")
+
+
 def _validar_calendario(ctx: Contexto, calendario_id, frecuencia: str | None) -> None:
     """El calendario de pago decide la frecuencia de la planilla: debe coincidir con la del colaborador,
     o la planilla calcularía con otra frecuencia (p. ej. salario mensual en una quincena)."""
@@ -56,14 +62,30 @@ def listar(ctx: Contexto = Depends(contexto_empresa), estado: str | None = "acti
 @r.post("", status_code=201)
 def crear(datos: EmpleadoIn, ctx: Contexto = Depends(operador)) -> dict:
     _validar_calendario(ctx, datos.calendario_id, datos.frecuencia)
+    _validar_tipo(ctx, datos.tipo_empleado)
     try:
         emp = crud.insertar(ctx.conn, "empleados", {**datos.model_dump(), "empresa_id": ctx.empresa_id})
     except psycopg.errors.UniqueViolation as exc:
-        raise HTTPException(409, "Ya existe un empleado con esa identificación") from exc
+        raise HTTPException(409, "Ya existe un colaborador con esa identificación en esta empresa.") from exc
     crud.insertar(ctx.conn, "movimientos_empleado", {"empresa_id": ctx.empresa_id, "empleado_id": emp["id"],
                                                      "tipo": "ingreso", "fecha": datos.fecha_ingreso,
                                                      "detalle": f"Ingreso como {datos.puesto or 'colaborador'}"})
+    if datos.vacaciones_saldo_inicial is not None and datos.vacaciones_corte:
+        emp = _rebase(ctx, emp["id"])
     return emp
+
+
+def _rebase(ctx: Contexto, id) -> dict:
+    from .autogestion import rebase_vacaciones
+    rebase_vacaciones(ctx.conn, id, hoy_cr())
+    return crud.obtener(ctx.conn, "empleados", id, ctx.empresa_id)
+
+
+@r.get("/{id}/vacaciones", summary="Saldo de vacaciones: inicial, acumulado, disfrutado y disponible")
+def vacaciones(id: UUID, ctx: Contexto = Depends(contexto_empresa)) -> dict:
+    from .autogestion import resumen_vacaciones
+    crud.obtener(ctx.conn, "empleados", id, ctx.empresa_id)
+    return resumen_vacaciones(ctx.conn, id)
 
 
 @r.get("/{id}")
@@ -79,6 +101,7 @@ def ver(id: UUID, ctx: Contexto = Depends(contexto_empresa)) -> dict:
 @r.patch("/{id}")
 def editar(id: UUID, datos: EmpleadoUpd, ctx: Contexto = Depends(operador)) -> dict:
     cambios = datos.model_dump(exclude_unset=True)
+    _validar_tipo(ctx, cambios.get("tipo_empleado"))
     if "calendario_id" in cambios or "frecuencia" in cambios:
         actual = crud.obtener(ctx.conn, "empleados", id, ctx.empresa_id)
         _validar_calendario(ctx, cambios.get("calendario_id", actual["calendario_id"]),
@@ -86,6 +109,8 @@ def editar(id: UUID, datos: EmpleadoUpd, ctx: Contexto = Depends(operador)) -> d
     fila = crud.actualizar(ctx.conn, "empleados", id, cambios, ctx.empresa_id)
     if not fila:
         raise HTTPException(404, "No encontrado")
+    if {"vacaciones_saldo_inicial", "vacaciones_corte"} & cambios.keys():
+        fila = _rebase(ctx, id)
     return fila
 
 

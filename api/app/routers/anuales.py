@@ -1,5 +1,5 @@
 """Aguinaldo y liquidaciones (Fase 3)."""
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 from uuid import UUID
 
@@ -28,6 +28,17 @@ def salarios_por_mes(conn, empleado_id, desde: date, hasta: date) -> dict[str, D
 
 
 # --------------------------------------------------------------- Aguinaldo --
+def aguinaldo_previo(emp: dict, desde: date, hasta: date) -> tuple[Decimal, date]:
+    """Saldo de aguinaldo traído de antes del sistema (como el «Aguinaldo acumulado» de Odoo).
+
+    Si la fecha de corte cae dentro del período, se toma el monto inicial y los salarios
+    se cuentan solo desde el día siguiente al corte."""
+    corte = emp.get("aguinaldo_corte")
+    inicial = Decimal(emp.get("aguinaldo_inicial") or 0)
+    if corte and inicial > 0 and desde <= corte <= hasta:
+        return inicial, corte + timedelta(days=1)
+    return Decimal(0), desde
+
 @r.post("/aguinaldo/calcular", summary="Calcular aguinaldo del año (dic a nov) y crear su planilla")
 def calcular_aguinaldo(datos: AguinaldoIn, ctx: Contexto = Depends(operador)) -> dict:
     desde, hasta = M.periodo_aguinaldo(datos.anio)
@@ -42,12 +53,15 @@ def calcular_aguinaldo(datos: AguinaldoIn, ctx: Contexto = Depends(operador)) ->
                      (ctx.empresa_id, datos.anio))
 
     empleados = ctx.conn.execute("""
-        select distinct e.* from empleados e join boletas b on b.empleado_id = e.id join planillas p on p.id = b.planilla_id
-         where e.empresa_id = %s and p.hasta between %s and %s and p.tipo in ('ordinaria','extraordinaria')
-           and p.estado in ('aprobada','cerrada')
+        select e.* from empleados e
+         where e.empresa_id = %(e)s
+           and (exists (select 1 from boletas b join planillas p on p.id = b.planilla_id
+                         where b.empleado_id = e.id and p.hasta between %(d)s and %(h)s
+                           and p.tipo in ('ordinaria','extraordinaria') and p.estado in ('aprobada','cerrada'))
+                or (e.aguinaldo_inicial > 0 and e.aguinaldo_corte between %(d)s and %(h)s))
            and not exists (select 1 from liquidaciones l where l.empleado_id = e.id and l.estado in ('aprobada','pagada')
-                           and l.fecha_salida between %s and %s)""",
-                                 (ctx.empresa_id, desde, hasta, desde, hasta)).fetchall()
+                           and l.fecha_salida between %(d)s and %(h)s)
+         order by e.apellidos, e.nombre""", {"e": ctx.empresa_id, "d": desde, "h": hasta}).fetchall()
     planilla = None
     if datos.crear_planilla:
         planilla = crud.insertar(ctx.conn, "planillas", {
@@ -55,7 +69,14 @@ def calcular_aguinaldo(datos: AguinaldoIn, ctx: Contexto = Depends(operador)) ->
             "fecha_pago": datos.fecha_pago or date(datos.anio, 12, 20), "descripcion": f"Aguinaldo {datos.anio}"})
     filas, total = [], Decimal(0)
     for e in empleados:
-        res = M.calcular_aguinaldo(datos.anio, salarios_por_mes(ctx.conn, e["id"], desde, hasta))
+        inicial, inicio = aguinaldo_previo(e, desde, hasta)
+        res = M.calcular_aguinaldo(datos.anio, salarios_por_mes(ctx.conn, e["id"], inicio, hasta))
+        if inicial:
+            # Aguinaldo acumulado antes de usar el sistema (dato de la ficha) + lo calculado desde el corte.
+            res.monto += inicial
+            res.total_salarios += inicial * 12
+            res.detalle = [{"mes": f"Acumulado al {e['aguinaldo_corte']}", "monto": str(inicial * 12),
+                            "nota": f"Aguinaldo acumulado antes del sistema: {inicial}"}, *res.detalle]
         if res.monto <= 0:
             continue
         ag = crud.insertar(ctx.conn, "aguinaldos", {
@@ -98,7 +119,8 @@ def _entrada_liquidacion(ctx: Contexto, datos: LiquidacionIn) -> tuple[dict, M.E
     meses = salarios_por_mes(ctx.conn, emp["id"], seis, salida)
     ultimos = [meses[k] for k in sorted(meses)][-6:] or [Decimal(emp["salario_mensual"])]
     ini_ag = date(salida.year if salida.month == 12 else salida.year - 1, 12, 1)
-    periodo_ag = sum(salarios_por_mes(ctx.conn, emp["id"], ini_ag, salida).values(), Decimal(0))
+    inicial, inicio_ag = aguinaldo_previo(emp, ini_ag, salida)
+    periodo_ag = inicial * 12 + sum(salarios_por_mes(ctx.conn, emp["id"], inicio_ag, salida).values(), Decimal(0))
     saldo_prest = Decimal(0)
     if datos.incluir_saldo_prestamos:
         saldo_prest = Decimal(ctx.conn.execute("select coalesce(sum(saldo),0) as s from prestamos where empleado_id = %s "
@@ -109,7 +131,10 @@ def _entrada_liquidacion(ctx: Contexto, datos: LiquidacionIn) -> tuple[dict, M.E
         dias_vacaciones_pendientes=datos.dias_vacaciones_pendientes if datos.dias_vacaciones_pendientes is not None
         else Decimal(emp["saldo_vacaciones"]),
         preaviso_otorgado=datos.preaviso_otorgado, salarios_pendientes=datos.salarios_pendientes,
-        otros_pagos=datos.otros_pagos, deducciones=saldo_prest + datos.deducciones_adicionales)
+        otros_pagos=datos.otros_pagos, deducciones=saldo_prest + datos.deducciones_adicionales,
+        aplicar_ccss_obrero=not (ctx.conn.execute(
+            "select liquidacion_sin_ccss from configuracion_planilla where empresa_id = %s",
+            (ctx.empresa_id,)).fetchone() or {}).get("liquidacion_sin_ccss", False))
     return emp, entrada, saldo_prest
 
 
@@ -197,6 +222,19 @@ def liquidacion_pdf(id: UUID, ctx: Contexto = Depends(contexto_empresa)) -> Resp
                     headers={"Content-Disposition": f'inline; filename="liquidacion-{e["identificacion"]}.pdf"'})
 
 
+def firma_constancia(ctx: Contexto, empresa_nombre: str) -> tuple[str, str]:
+    """(pie de firma, lugar de emisión) con el firmante de Configuración › Planilla, o la empresa si no hay."""
+    import html as _h
+    f = ctx.conn.execute("""select firmante_nombre, firmante_cargo, firmante_telefono, firmante_correo, firmante_lugar
+                              from configuracion_planilla where empresa_id = %s""", (ctx.empresa_id,)).fetchone() or {}
+    partes = [f.get("firmante_nombre"), f.get("firmante_cargo") or (None if f.get("firmante_nombre") else "Firma y sello"),
+              empresa_nombre if f.get("firmante_nombre") else None,
+              " · ".join(x for x in (f.get("firmante_telefono"), f.get("firmante_correo")) if x) or None]
+    lugar = f"{_h.escape(f['firmante_lugar'])}, " if f.get("firmante_lugar") else ""
+    return ("<br/><br/><br/>______________________________<br/>"
+            + "<br/>".join(_h.escape(x) for x in partes if x), lugar)
+
+
 @r.get("/liquidaciones/{id}/constancia", response_class=Response, summary="Constancia de salida (carta)")
 def constancia(id: UUID, ctx: Contexto = Depends(contexto_empresa)) -> Response:
     l = crud.obtener(ctx.conn, "liquidaciones", id, ctx.empresa_id)
@@ -206,9 +244,28 @@ def constancia(id: UUID, ctx: Contexto = Depends(contexto_empresa)) -> Response:
              f"{e['nombre']} {e['apellidos']}, identificación {e['identificacion']}, laboró para la empresa desde el "
              f"{pdf.fecha(e['fecha_ingreso'])} hasta el {pdf.fecha(l['fecha_salida'])}, en el puesto de "
              f"{e['puesto'] or 'colaborador(a)'}. Motivo de la terminación: {MOTIVOS[l['motivo']].lower()}. "
-             f"Se extiende la presente a solicitud de la persona interesada el {pdf.fecha(hoy_cr())}.")
-    contenido = pdf.documento_simple("Constancia laboral", emp["nombre"], [], texto +
-                                     "<br/><br/><br/>______________________________<br/>Firma y sello",
+             "Se extiende la presente a solicitud de la persona interesada")
+    firma, lugar = firma_constancia(ctx, emp["nombre"])
+    texto += f" en {lugar}el {pdf.fecha(hoy_cr())}." if lugar else f" el {pdf.fecha(hoy_cr())}."
+    contenido = pdf.documento_simple("Constancia laboral", emp["nombre"], [], texto + firma,
+                                     logo=marca.logo(ctx.conn, ctx.empresa_id))
+    return Response(contenido, media_type="application/pdf",
+                    headers={"Content-Disposition": f'inline; filename="constancia-{e["identificacion"]}.pdf"'})
+
+
+@r.get("/empleados/{id}/constancia", response_class=Response, summary="Constancia laboral de un colaborador activo")
+def constancia_activo(id: UUID, salario: bool = False, ctx: Contexto = Depends(contexto_empresa)) -> Response:
+    e = crud.obtener(ctx.conn, "empleados", id, ctx.empresa_id)
+    emp = ctx.conn.execute("select nombre, cedula_juridica from empresas where id = %s", (ctx.empresa_id,)).fetchone()
+    texto = (f"{emp['nombre']}, cédula jurídica {emp['cedula_juridica'] or '—'}, hace constar que "
+             f"{e['nombre']} {e['apellidos']}, identificación {e['identificacion']}, labora para la empresa desde el "
+             f"{pdf.fecha(e['fecha_ingreso'])}, en el puesto de {e['puesto'] or 'colaborador(a)'}")
+    if salario:
+        texto += f", con un salario mensual bruto de {pdf.colones(e['salario_mensual'])}"
+    texto += ". Se extiende la presente a solicitud de la persona interesada"
+    firma, lugar = firma_constancia(ctx, emp["nombre"])
+    texto += f" en {lugar}el {pdf.fecha(hoy_cr())}." if lugar else f" el {pdf.fecha(hoy_cr())}."
+    contenido = pdf.documento_simple("Constancia laboral", emp["nombre"], [], texto + firma,
                                      logo=marca.logo(ctx.conn, ctx.empresa_id))
     return Response(contenido, media_type="application/pdf",
                     headers={"Content-Disposition": f'inline; filename="constancia-{e["identificacion"]}.pdf"'})

@@ -140,8 +140,9 @@ def nuevo_usuario(dsn, nombre):
     return {"id": uid, "h": token(uid, f"{nombre}@prueba.cr")}
 
 
-def nueva_empresa(client, dsn, *, empleados=0, codigo=None, cedula="3-101-555555"):
+def nueva_empresa(client, dsn, *, empleados=0, codigo=None, cedula=None):
     adm = nuevo_usuario(dsn, "adm")
+    cedula = cedula or f"3-101-{uuid.uuid4().int % 1_000_000:06d}"     # cédula única por empresa
     r = client.post("/empresas", json={"nombre": f"Empresa {uuid.uuid4().hex[:5]} SA", "cedula_juridica": cedula,
                                        "codigo_referido": codigo}, headers=adm["h"])
     assert r.status_code == 201, r.text
@@ -155,7 +156,7 @@ def nueva_empresa(client, dsn, *, empleados=0, codigo=None, cedula="3-101-555555
 
 def crear_cliente(client, duena, eid=None, **extra):
     datos = {"empresa_id": eid, "razon_social": f"Cliente {uuid.uuid4().hex[:5]} SA", "tipo_identificacion": "02",
-             "identificacion": "3-101-555555", "correo_facturacion": "pagos@cliente.cr", "alta": "2026-10-01", **extra}
+             "identificacion": f"3-101-{uuid.uuid4().int % 1_000_000:06d}", "correo_facturacion": "pagos@cliente.cr", "alta": "2026-10-01", **extra}
     r = client.post("/negocio/clientes", json={k: v for k, v in datos.items() if v is not None}, headers=duena)
     assert r.status_code == 201, r.text
     return r.json()
@@ -531,11 +532,11 @@ def test_webhook_confirma_con_consult(client, dsn, duena, mock):
 
 # -------------------------------------------------- vista del cliente ------
 def test_suscripcion_solo_de_mi_empresa_y_registro_de_tarjeta(client, dsn, duena, mock):
-    eid, adm = nueva_empresa(client, dsn, empleados=55, cedula="3-101-777777")
+    eid, adm = nueva_empresa(client, dsn, empleados=55, cedula="3-101-777779")
     otra, adm2 = nueva_empresa(client, dsn)
     s = client.get(f"/empresas/{eid}/suscripcion", headers=adm["h"])
     # Con cédula, la ficha de cobro existe desde el registro (en prueba, sin cobrar).
-    assert s.status_code == 200 and s.json()["cliente"]["identificacion"] == "3101777777"
+    assert s.status_code == 200 and s.json()["cliente"]["identificacion"] == "3101777779"
     assert s.json()["precio"]["subtotal"] == "66000.00" and s.json()["estado"] == "prueba"
     assert client.get(f"/empresas/{otra}/suscripcion", headers=adm["h"]).status_code == 404
     assert client.get(f"/empresas/{eid}/suscripcion", headers=adm2["h"]).status_code == 404
@@ -545,7 +546,7 @@ def test_suscripcion_solo_de_mi_empresa_y_registro_de_tarjeta(client, dsn, duena
     assert r.json()["url"].startswith("https://secure.tilopay.com/")
     cli = client.get("/negocio/clientes", headers=duena).json()
     mio = [c for c in cli if c["empresa_id"] == eid][0]
-    assert mio["identificacion"] == "3101777777" and mio["tipo_identificacion"] == "02"
+    assert mio["identificacion"] == "3101777779" and mio["tipo_identificacion"] == "02"
 
     estado = tilopay.firmar_estado({"c": mio["id"], "e": eid, "m": "x@cliente.cr", "t": int(__import__("time").time())})
     malo = client.get(f"/webhooks/tilopay/retorno?estado={estado[:-2]}xx&card=tok-tarjeta&last=4111", follow_redirects=False)

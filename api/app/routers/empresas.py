@@ -14,6 +14,7 @@ from ..auth import (
     Contexto,
     Usuario,
     admin_empresa,
+    admin_plataforma,
     conexion,
     contexto_empresa,
     usuario_actual,
@@ -27,11 +28,16 @@ from ..esquemas import (
     ConfiguracionIn,
     EmpresaIn,
     FeriadoIn,
+    BonoAntiguedadIn,
     HorarioIn,
     LogoIn,
     ModuloCodigo,
     NuevaEmpresa,
+    SalarioMinimoIn,
     SucursalIn,
+    TipoCobroIn,
+    TipoDocumentoIn,
+    TipoEmpleadoIn,
     UsuarioEmpresaIn,
     UsuarioEmpresaUpd,
 )
@@ -262,4 +268,42 @@ catalogos = [
     crud.crud_router("sucursales", "sucursales", SucursalIn, filtros=(), orden="nombre", etiqueta="catalogos"),
     crud.crud_router("calendarios", "calendarios_pago", CalendarioIn, filtros=(), orden="nombre", etiqueta="catalogos"),
     crud.crud_router("horarios", "tipos_horario", HorarioIn, filtros=(), orden="nombre", etiqueta="catalogos"),
+    crud.crud_router("tipos-empleado", "tipos_empleado", TipoEmpleadoIn, filtros=(), orden="nombre", etiqueta="catalogos"),
+    crud.crud_router("tipos-documento", "tipos_documento", TipoDocumentoIn, filtros=(), orden="orden", etiqueta="catalogos"),
+    crud.crud_router("tipos-cobro", "tipos_cobro", TipoCobroIn, filtros=(), orden="orden", etiqueta="catalogos"),
+    crud.crud_router("bono-antiguedad", "bono_antiguedad", BonoAntiguedadIn, filtros=(), orden="desde_anios",
+                     etiqueta="catalogos"),
 ]
+
+
+@r.post("/empresas/{empresa_id}/catalogos/restaurar", tags=["catalogos"],
+        summary="Volver a cargar los datos predeterminados que falten (horarios, tipos, documentos, cobros)")
+def restaurar_catalogos(ctx: Contexto = Depends(admin_empresa)) -> dict:
+    ctx.conn.execute("select public.restaurar_catalogos(%s)", (ctx.empresa_id,))
+    return {"ok": True}
+
+
+@r.get("/salarios-minimos", tags=["catalogos"], summary="Salarios mínimos del MTSS (vigentes y anteriores)")
+def salarios_minimos(conn: Conexion = Depends(conexion)) -> list[dict]:
+    return conn.execute("select * from salarios_minimos order by vigente_desde desc, monto").fetchall()
+
+
+@r.post("/plataforma/salarios-minimos", status_code=201, tags=["catalogos"])
+def crear_salario_minimo(datos: SalarioMinimoIn, conn: Conexion = Depends(admin_plataforma)) -> dict:
+    return conn.execute("""insert into salarios_minimos (categoria, monto, vigente_desde, decreto) values (%s,%s,%s,%s)
+                           returning *""", (datos.categoria, datos.monto, datos.vigente_desde, datos.decreto)).fetchone()
+
+
+@r.patch("/plataforma/salarios-minimos/{id}", tags=["catalogos"])
+def editar_salario_minimo(id: UUID, datos: SalarioMinimoIn, conn: Conexion = Depends(admin_plataforma)) -> dict:
+    fila = conn.execute("""update salarios_minimos set categoria = %s, monto = %s, vigente_desde = %s, decreto = %s
+                            where id = %s returning *""",
+                        (datos.categoria, datos.monto, datos.vigente_desde, datos.decreto, id)).fetchone()
+    if not fila:
+        raise HTTPException(404, "No encontrado")
+    return fila
+
+
+@r.delete("/plataforma/salarios-minimos/{id}", status_code=204, tags=["catalogos"])
+def borrar_salario_minimo(id: UUID, conn: Conexion = Depends(admin_plataforma)) -> None:
+    conn.execute("delete from salarios_minimos where id = %s", (id,))

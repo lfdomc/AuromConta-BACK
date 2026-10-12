@@ -61,6 +61,8 @@ class EntradaLiquidacion:
     otros_pagos: Decimal = CERO
     deducciones: Decimal = CERO                   # saldo de préstamos, adelantos
     aplicar_ccss_vacaciones: bool = True
+    # Configuración de la empresa (Odoo: «Liquidaciones: no descontar CCSS obrero»)
+    aplicar_ccss_obrero: bool = True
 
 
 @dataclass
@@ -152,7 +154,8 @@ def calcular_liquidacion(e: EntradaLiquidacion, p: ParametrosLegales | None = No
 
     # Vacaciones y salarios pendientes son salario: cotizan CCSS obrero.
     # Preaviso, cesantía y aguinaldo no cotizan.
-    base_ccss = (vacaciones if e.aplicar_ccss_vacaciones else CERO) + D(e.salarios_pendientes)
+    base_ccss = ((vacaciones if e.aplicar_ccss_vacaciones else CERO) + D(e.salarios_pendientes)
+                 if e.aplicar_ccss_obrero else CERO)
     ccss = r2(base_ccss * p.ccss_obrero)
 
     bruto = r2(preaviso + cesantia + vacaciones + aguinaldo + D(e.salarios_pendientes) + D(e.otros_pagos))

@@ -609,7 +609,8 @@ def mi_boleta_pdf(id: UUID, u: Usuario = Depends(usuario_actual), conn: Conexion
     empresa = {"nombre": pl["empresa_nombre"], "cedula_juridica": pl["cedula_juridica"]}
     planilla = {"desde": pl["desde"], "hasta": pl["hasta"], "fecha_pago": pl["fecha_pago"]}
     contenido = pdf.boleta_pdf(empresa, planilla, empleado, b, lineas, pl["nota_boleta"],
-                               logo=marca.logo(conn, b["empresa_id"]))
+                               logo=marca.logo(conn, b["empresa_id"]), saldo_vacaciones=pl["boleta_saldo_vacaciones"],
+                               detalle_subsidio=pl["boleta_detalle_subsidio"])
     return Response(contenido, media_type="application/pdf",
                     headers={"Content-Disposition": f'inline; filename="boleta-{pl["hasta"]}.pdf"'})
 

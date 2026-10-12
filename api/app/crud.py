@@ -19,7 +19,8 @@ TABLAS = frozenset({
     "documentos_empleado", "embargos", "empleados", "empresas", "feriados", "historial_salarial", "horas_extra",
     "incapacidades", "liquidaciones", "marcas_asistencia", "movimientos_empleado", "otras_deducciones",
     "pensiones_alimentarias", "permisos", "planillas", "prestamo_pagos", "prestamos", "rebajos_renta", "socios",
-    "sucursales", "tickets", "tipos_horario", "usuarios_empresa", "vacaciones",
+    "sucursales", "tickets", "tipos_horario", "usuarios_empresa", "vacaciones", "tipos_empleado", "tipos_documento",
+    "tipos_cobro", "bono_antiguedad",
     "negocio.cambios_normativos", "negocio.clientes", "negocio.comprobantes", "negocio.gastos",
 })
 
@@ -30,6 +31,8 @@ ORDENES: dict[str, LiteralString] = {
     "entrada desc": "entrada desc",
     "fecha desc": "fecha desc",
     "nombre": "nombre",
+    "orden": "orden, nombre",
+    "desde_anios": "desde_anios",
 }
 
 # Columnas de fecha por las que pueden filtrar los listados genéricos (desde / hasta).

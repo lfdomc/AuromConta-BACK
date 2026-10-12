@@ -231,3 +231,32 @@ def test_pasar_de_prueba_a_cobro(client, usuarios, dsn):
         c.execute("update empresas set estado_servicio = 'prueba' where id = %s", (eid,))
     r = client.patch(f"/plataforma/empresas/{eid}", json={"estado_servicio": "activo"}, headers=d)
     assert r.json()["cliente"]["alta"] == str(hoy_cr())
+
+
+def test_identificaciones_sin_duplicados(client, usuarios):
+    """Cédula jurídica única entre empresas vigentes, colaborador único por empresa, cliente único;
+    se compara sin guiones: 3-101-555666 = 3101555666."""
+    a, otro, d = usuarios["admin"]["h"], usuarios["otro"]["h"], usuarios["duena"]["h"]
+    e1 = client.post("/empresas", json={"nombre": "Única SA", "cedula_juridica": "3-101-555666"}, headers=a)
+    assert e1.status_code == 201, e1.text
+    r = client.post("/empresas", json={"nombre": "Copia SA", "cedula_juridica": "3101555666"}, headers=otro)
+    assert r.status_code == 409 and "cédula jurídica" in r.json()["detail"]
+    # Dada de baja, la cédula queda libre para registrarse de nuevo
+    client.patch(f"/plataforma/empresas/{e1.json()['id']}", json={"estado_servicio": "baja"}, headers=d)
+    assert client.post("/empresas", json={"nombre": "Nueva SA", "cedula_juridica": "3101555666"}, headers=otro).status_code == 201
+    # Colaboradores: mismo número con otro formato en la misma empresa
+    eid = client.post("/empresas", json={"nombre": "Colabs SA", "cedula_juridica": "3-101-555667"}, headers=a).json()["id"]
+    base = {"fecha_ingreso": "2026-01-01", "frecuencia": "biweekly", "nombre": "Ana", "apellidos": "Mora", "salario_mensual": "500000"}
+    assert client.post(f"/empresas/{eid}/empleados", json={**base, "identificacion": "1-0234-0567"}, headers=a).status_code == 201
+    r = client.post(f"/empresas/{eid}/empleados", json={**base, "identificacion": "102340567"}, headers=a)
+    assert r.status_code == 409 and "colaborador" in r.json()["detail"]
+    # Clientes del negocio
+    c = {"razon_social": "Cliente Manual", "identificacion": "3-102-111222", "correo_facturacion": "c@m.cr"}
+    assert client.post("/negocio/clientes", json=c, headers=d).status_code == 201
+    r = client.post("/negocio/clientes", json={**c, "razon_social": "Otra vez"}, headers=d)
+    assert r.status_code == 409 and "identificación" in r.json()["detail"]
+    # Si esa empresa se registra después, se vincula al cliente existente en vez de duplicarlo
+    nueva = client.post("/empresas", json={"nombre": "Cliente Manual", "cedula_juridica": "3102111222"}, headers=otro)
+    assert nueva.status_code == 201, nueva.text
+    fichas = [x for x in client.get("/negocio/clientes", headers=d).json() if x["identificacion"] == "3102111222"]
+    assert len(fichas) == 1 and fichas[0]["empresa_id"] == nueva.json()["id"]

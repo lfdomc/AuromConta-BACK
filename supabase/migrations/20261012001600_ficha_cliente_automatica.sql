@@ -15,6 +15,11 @@ begin
   if v_emp is null or v_emp.estado_servicio = 'baja' then return; end if;
   v_ced := regexp_replace(coalesce(v_emp.cedula_juridica, ''), '\D', '', 'g');
   if v_ced = '' then return; end if;                      -- sin cédula no se puede facturar todavía
+  -- Si ya existe un cliente con esa cédula creado a mano (sin empresa), se vincula en vez de duplicarlo.
+  update negocio.clientes set empresa_id = p_empresa
+   where empresa_id is null and estado <> 'baja'
+     and regexp_replace(coalesce(identificacion, ''), '\D', '', 'g') = v_ced;
+  if found then return; end if;
   v_correo := nullif(trim(coalesce(v_emp.correo, '')), '');
   if v_correo is null then
     select u.email into v_correo from auth.users u where u.id = v_emp.creado_por;
@@ -24,7 +29,8 @@ begin
                                 telefono, estado, alta)
   values (p_empresa, v_emp.nombre,
           case when length(v_ced) = 9 then '01' when length(v_ced) in (11, 12) then '03' else '02' end,
-          v_ced, v_correo, v_emp.telefono, v_emp.estado_servicio, v_emp.creado_en::date);
+          v_ced, v_correo, v_emp.telefono, v_emp.estado_servicio, v_emp.creado_en::date)
+  on conflict do nothing;   -- si otra ficha vigente ya usa esa identificación, no se bloquea el registro
 end $$;
 revoke all on function negocio.asegurar_ficha_cliente(uuid) from public, anon, authenticated;
 

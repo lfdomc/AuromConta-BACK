@@ -1,4 +1,5 @@
 """Planillas: crear, calcular, aprobar, cerrar, reabrir, boletas, PDF y correo."""
+from decimal import Decimal
 from uuid import UUID
 
 import psycopg
@@ -131,7 +132,27 @@ def aprobar(id: UUID, ctx: Contexto = Depends(aprobador)) -> dict:
     errores = [a for a in pl["advertencias"] if a.get("nivel") == "error"]
     if errores:
         raise HTTPException(409, "Corrija los errores antes de aprobar: " + "; ".join(a["mensaje"] for a in errores))
+    _exigir_renta_al_dia(ctx, pl)
     return _cambiar_estado(ctx, id, "aprobada")
+
+
+def _exigir_renta_al_dia(ctx: Contexto, pl: dict) -> None:
+    """Método mensual consolidado: la renta de la última planilla del mes depende de las anteriores del mes.
+    Si alguna se recalculó después de esta, la renta quedó vieja: hay que recalcular antes de aprobar
+    (equivalente al recálculo al confirmar del módulo Odoo, FIX17)."""
+    cfg = ctx.conn.execute("select metodo_renta from configuracion_planilla where empresa_id = %s",
+                           (ctx.empresa_id,)).fetchone()
+    if pl["tipo"] != "ordinaria" or not cfg or cfg["metodo_renta"] != "monthly_consolidated" or not pl["calculada_en"]:
+        return
+    otra = ctx.conn.execute("""select desde, hasta from planillas
+                                where empresa_id = %s and id <> %s and tipo = 'ordinaria' and frecuencia = %s
+                                  and hasta < %s and date_trunc('month', hasta) = date_trunc('month', %s::date)
+                                  and calculada_en > %s
+                                order by calculada_en desc limit 1""",
+                            (ctx.empresa_id, pl["id"], pl["frecuencia"], pl["desde"], pl["hasta"], pl["calculada_en"])).fetchone()
+    if otra:
+        raise HTTPException(409, f"La planilla del {otra['desde']:%d/%m} al {otra['hasta']:%d/%m} se recalculó después de esta "
+                                 "y la renta del mes depende de ella. Use «Recalcular» y luego apruebe.")
 
 
 @r.post("/{id}/devolver", summary="Devolver una planilla aprobada a revisión")
@@ -166,11 +187,22 @@ def reabrir(id: UUID, datos: ReabrirIn, ctx: Contexto = Depends(aprobador)) -> d
 
 @r.get("/{id}/asiento", summary="Asiento contable vigente de la planilla")
 def asiento(id: UUID, ctx: Contexto = Depends(contexto_empresa)) -> dict:
-    a = ctx.conn.execute("select * from asientos where origen_id = %s and empresa_id = %s and estado = 'vigente'",
-                         (id, ctx.empresa_id)).fetchone()
-    if not a:
+    todos = ctx.conn.execute("""select * from asientos where origen_id = %s and empresa_id = %s and estado = 'vigente'
+                                 order by descripcion""", (id, ctx.empresa_id)).fetchall()
+    if not todos:
         raise HTTPException(404, "La planilla aún no tiene asiento (se genera al cerrar)")
-    a["lineas"] = ctx.conn.execute("select * from asiento_lineas where asiento_id = %s order by orden", (a["id"],)).fetchall()
+    a = dict(todos[0])
+    # Con «un asiento por boleta» se muestran todas las líneas juntas; cada línea dice de quién es.
+    a["cantidad"] = len(todos)
+    a["lineas"] = []
+    for x in todos:
+        quien = x["descripcion"].split(" · ", 1)[1] if len(todos) > 1 and " · " in x["descripcion"] else None
+        for l in ctx.conn.execute("select * from asiento_lineas where asiento_id = %s order by orden", (x["id"],)).fetchall():
+            a["lineas"].append({**l, "descripcion": f"{quien} · {l['descripcion']}" if quien else l["descripcion"]})
+    if len(todos) > 1:
+        a["descripcion"] = f"{len(todos)} asientos (uno por boleta)"
+        a["total_debito"] = sum((x["total_debito"] for x in todos), Decimal(0))
+        a["total_credito"] = sum((x["total_credito"] for x in todos), Decimal(0))
     return a
 
 
@@ -196,9 +228,11 @@ def _pdf_boleta(conn, empresa_id, planilla: dict, boleta: dict) -> bytes:
     empresa = conn.execute("select * from empresas where id = %s", (empresa_id,)).fetchone()
     empleado = conn.execute("select * from empleados where id = %s", (boleta["empleado_id"],)).fetchone()
     lineas = conn.execute("select * from boleta_lineas where boleta_id = %s order by orden", (boleta["id"],)).fetchall()
-    nota = conn.execute("select nota_boleta from configuracion_planilla where empresa_id = %s", (empresa_id,)).fetchone()
-    return pdf.boleta_pdf(empresa, planilla, empleado, boleta, lineas, nota["nota_boleta"] if nota else None,
-                          logo=marca.logo(conn, empresa_id))
+    cfg = conn.execute("""select nota_boleta, boleta_saldo_vacaciones, boleta_detalle_subsidio
+                            from configuracion_planilla where empresa_id = %s""", (empresa_id,)).fetchone() or {}
+    return pdf.boleta_pdf(empresa, planilla, empleado, boleta, lineas, cfg.get("nota_boleta"),
+                          logo=marca.logo(conn, empresa_id), saldo_vacaciones=bool(cfg.get("boleta_saldo_vacaciones")),
+                          detalle_subsidio=bool(cfg.get("boleta_detalle_subsidio")))
 
 
 @r.get("/{id}/boletas/{boleta_id}/pdf", response_class=Response)
@@ -216,13 +250,16 @@ def enviar(id: UUID, datos: EnviarIn, ctx: Contexto = Depends(operador)) -> dict
     if pl["estado"] not in ("aprobada", "cerrada"):
         raise HTTPException(409, "Las boletas se envían cuando la planilla está aprobada o cerrada")
     empresa = ctx.conn.execute("select nombre from empresas where id = %s", (ctx.empresa_id,)).fetchone()
+    cfg = ctx.conn.execute("""select correo_asunto, correo_cuerpo, correo_firma, correo_remitente
+                                from configuracion_planilla where empresa_id = %s""", (ctx.empresa_id,)).fetchone() or {}
+    periodo = f"{pl['desde']:%d/%m/%Y} al {pl['hasta']:%d/%m/%Y}"
     q = sql.SQL("select * from boletas where planilla_id = %s")
     p: list = [id]
     if datos.boleta_ids:
         q += sql.SQL(" and id = any(%s)"); p.append(list(datos.boleta_ids))
     resumen = {"enviadas": 0, "errores": 0, "sin_correo": 0}
     for b in ctx.conn.execute(q, p).fetchall():
-        emp = ctx.conn.execute("select nombre, correo from empleados where id = %s", (b["empleado_id"],)).fetchone()
+        emp = ctx.conn.execute("select nombre, apellidos, correo from empleados where id = %s", (b["empleado_id"],)).fetchone()
         if not emp["correo"]:
             resumen["sin_correo"] += 1
             ctx.conn.execute("insert into envios_boleta (empresa_id, boleta_id, estado, error) values (%s,%s,'omitido','Sin correo')",
@@ -230,10 +267,14 @@ def enviar(id: UUID, datos: EnviarIn, ctx: Contexto = Depends(operador)) -> dict
             continue
         try:
             archivo = _pdf_boleta(ctx.conn, ctx.empresa_id, pl, b)
-            correo.enviar(emp["correo"], f"Boleta de pago {pl['desde']:%d/%m} al {pl['hasta']:%d/%m/%Y} · {empresa['nombre']}",
-                          f"<p>Hola {emp['nombre']},</p><p>Adjuntamos su boleta de pago del periodo "
-                          f"{pl['desde']:%d/%m/%Y} al {pl['hasta']:%d/%m/%Y}.</p><p>{empresa['nombre']}</p>",
-                          [(f"boleta-{pl['hasta']}.pdf", archivo)])
+            datos = {"periodo": periodo, "empresa": empresa["nombre"],
+                     "colaborador": f"{emp['nombre']} {emp.get('apellidos') or ''}".strip()}
+            cuerpo = correo.plantilla(cfg.get("correo_cuerpo"), correo.CUERPO_BOLETA, **datos)
+            if cfg.get("correo_firma"):
+                cuerpo += "\n\n" + cfg["correo_firma"]
+            correo.enviar(emp["correo"], correo.plantilla(cfg.get("correo_asunto"), correo.ASUNTO_BOLETA, **datos),
+                          correo.a_html(cuerpo), [(f"boleta-{pl['hasta']}.pdf", archivo)],
+                          responder_a=cfg.get("correo_remitente"))
             ctx.conn.execute("insert into envios_boleta (empresa_id, boleta_id, destino, estado) values (%s,%s,%s,'enviado')",
                              (ctx.empresa_id, b["id"], emp["correo"]))
             resumen["enviadas"] += 1

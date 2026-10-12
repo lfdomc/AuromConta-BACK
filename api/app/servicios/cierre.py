@@ -11,38 +11,54 @@ from . import contable
 
 
 def generar_asiento(conn: Conexion, planilla: dict) -> dict:
-    boletas = conn.execute("select resultado, neto from boletas where planilla_id = %s", (planilla["id"],)).fetchall()
-    if planilla["tipo"] == "aguinaldo":
-        # El aguinaldo ya se provisionó en cada planilla: se paga contra la provisión.
-        total_ag = sum((Decimal(b["neto"]) for b in boletas), Decimal(0))
-        lineas = [M.LineaAsiento("prov_aguinaldo", "Pago de aguinaldo contra provisión", debito=total_ag),
-                  M.LineaAsiento("salarios_por_pagar", "Aguinaldo por pagar", credito=total_ag)]
+    """Asiento de la planilla. Configuración › Planilla › «Asiento contable»: uno consolidado por planilla
+    (por defecto) o uno por boleta, como el módulo Odoo. Devuelve el primero (o el único)."""
+    boletas = conn.execute("""select b.resultado, b.neto, trim(e.nombre || ' ' || coalesce(e.apellidos, '')) as colaborador
+                                from boletas b join empleados e on e.id = b.empleado_id
+                               where b.planilla_id = %s order by e.apellidos, e.nombre""", (planilla["id"],)).fetchall()
+    modo = (conn.execute("select asiento_modo from configuracion_planilla where empresa_id = %s",
+                         (planilla["empresa_id"],)).fetchone() or {}).get("asiento_modo") or "planilla"
+    periodo = f"del {planilla['desde']} al {planilla['hasta']}"
+
+    def lineas_de(bols: list[dict]) -> list:
+        if planilla["tipo"] == "aguinaldo":
+            # El aguinaldo ya se provisionó en cada planilla: se paga contra la provisión.
+            total_ag = sum((Decimal(b["neto"]) for b in bols), Decimal(0))
+            return [M.LineaAsiento("prov_aguinaldo", "Pago de aguinaldo contra provisión", debito=total_ag),
+                    M.LineaAsiento("salarios_por_pagar", "Aguinaldo por pagar", credito=total_ag)]
+        return M.asiento_planilla([M.resultado_desde_dict(b["resultado"]) for b in bols])
+
+    if modo == "empleado" and boletas:
+        grupos = [(f"Planilla {planilla['tipo']} {periodo} · {b['colaborador']}", lineas_de([b])) for b in boletas]
     else:
-        lineas = M.asiento_planilla([M.resultado_desde_dict(b["resultado"]) for b in boletas])
-    if not M.cuadra(lineas):
-        raise ValueError("El asiento no cuadra")
+        grupos = [(f"Planilla {planilla['tipo']} {periodo}", lineas_de(boletas))]
+    for _, lineas in grupos:
+        if not M.cuadra(lineas):
+            raise ValueError("El asiento no cuadra")
     cuentas = {c["concepto"]: c for c in conn.execute(
         "select concepto, codigo, nombre from cuentas_contables where empresa_id = %s", (planilla["empresa_id"],)).fetchall()}
-    total = sum((l.debito for l in lineas), Decimal(0))
     conn.execute("update asientos set estado = 'reemplazado' where origen = 'planilla' and origen_id = %s and estado = 'vigente'",
                  (planilla["id"],))
-    a = conn.execute("""insert into asientos (empresa_id, origen, origen_id, fecha, descripcion, total_debito, total_credito)
-                        values (%s, %s, %s, %s, %s, %s, %s) returning *""",
-                     (planilla["empresa_id"], "aguinaldo" if planilla["tipo"] == "aguinaldo" else "planilla", planilla["id"],
-                      planilla["hasta"], f"Planilla {planilla['tipo']} del {planilla['desde']} al {planilla['hasta']}",
-                      total, total)).fetchone()
-    with conn.cursor() as cur:
-        cur.executemany("""insert into asiento_lineas (empresa_id, asiento_id, cuenta_codigo, cuenta_nombre, descripcion,
-                           debito, credito, orden) values (%s,%s,%s,%s,%s,%s,%s,%s)""",
-                        [(planilla["empresa_id"], a["id"], cuentas.get(l.concepto, {}).get("codigo", l.concepto),
-                          cuentas.get(l.concepto, {}).get("nombre", l.descripcion), l.descripcion, l.debito, l.credito, i)
-                         for i, l in enumerate(lineas)])
-    # Con el módulo de Contabilidad activo, el asiento entra solo al diario de Planillas.
-    contable.desde_planilla(conn, planilla, [
-        {"concepto": l.concepto, "codigo": cuentas.get(l.concepto, {}).get("codigo", l.concepto),
-         "nombre": cuentas.get(l.concepto, {}).get("nombre", l.descripcion), "descripcion": l.descripcion,
-         "debito": l.debito, "credito": l.credito} for l in lineas])
-    return a
+    primero = None
+    for i, (descripcion, lineas) in enumerate(grupos):
+        total = sum((l.debito for l in lineas), Decimal(0))
+        a = conn.execute("""insert into asientos (empresa_id, origen, origen_id, fecha, descripcion, total_debito, total_credito)
+                            values (%s, %s, %s, %s, %s, %s, %s) returning *""",
+                         (planilla["empresa_id"], "aguinaldo" if planilla["tipo"] == "aguinaldo" else "planilla", planilla["id"],
+                          planilla["hasta"], descripcion, total, total)).fetchone()
+        primero = primero or a
+        with conn.cursor() as cur:
+            cur.executemany("""insert into asiento_lineas (empresa_id, asiento_id, cuenta_codigo, cuenta_nombre, descripcion,
+                               debito, credito, orden) values (%s,%s,%s,%s,%s,%s,%s,%s)""",
+                            [(planilla["empresa_id"], a["id"], cuentas.get(l.concepto, {}).get("codigo", l.concepto),
+                              cuentas.get(l.concepto, {}).get("nombre", l.descripcion), l.descripcion, l.debito, l.credito, j)
+                             for j, l in enumerate(lineas)])
+        # Con el módulo de Contabilidad activo, el asiento entra solo al diario de Planillas.
+        contable.desde_planilla(conn, planilla, [
+            {"concepto": l.concepto, "codigo": cuentas.get(l.concepto, {}).get("codigo", l.concepto),
+             "nombre": cuentas.get(l.concepto, {}).get("nombre", l.descripcion), "descripcion": l.descripcion,
+             "debito": l.debito, "credito": l.credito} for l in lineas], descripcion=descripcion, limpiar=i == 0)
+    return primero
 
 
 class ConflictoCierre(ValueError):

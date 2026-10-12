@@ -88,7 +88,9 @@ def armar_entrada(conn, pl: dict, emp: dict, cfg: M.ConfigEmpresa) -> tuple[M.En
         salario_mensual=salario, frecuencia=frec, fecha_ingreso=emp["fecha_ingreso"],
         fecha_nacimiento=emp["fecha_nacimiento"], pensionado=emp["pensionado"],
         clase_riesgo_ins=emp["clase_riesgo_ins"] or pl.get("_clase_riesgo_empresa") or "II",
-        hijos=emp["hijos"], conyuge=emp["conyuge"], num_empleadores=emp["num_empleadores"], exento=emp["exento"],
+        hijos=emp["hijos"], conyuge=emp["conyuge"], num_empleadores=emp["num_empleadores"],
+        # No asegurado en la CCSS = sin CCSS, renta ni INS (la «planilla SP» del módulo Odoo).
+        exento=emp["exento"] or not emp.get("asegurado_ccss", True),
         por_asistencia=emp["por_asistencia"], tarifa_hora=Decimal(emp["tarifa_hora"]), medio_tiempo=emp["medio_tiempo"],
         aplica_rop=emp["aplica_rop"])
 
@@ -176,14 +178,20 @@ def armar_entrada(conn, pl: dict, emp: dict, cfg: M.ConfigEmpresa) -> tuple[M.En
         valor = r2(Decimal(x["valor"]) * ff) if x["tipo"] == "fijo" else Decimal(x["valor"])
         e.embargos.append(M.Embargo(x["tipo"], valor, x["expediente"], referencia=str(x["id"])))
 
-    # Boletas anteriores del mismo mes ya aprobadas (método mensual consolidado)
+    # Boletas del mismo mes en otras planillas (método mensual consolidado).
+    # Igual que el módulo Odoo (FIX17): cuentan aunque no estén aprobadas; si no, al calcular las dos
+    # quincenas antes de aprobar, la última del mes calculaba la renta sobre una sola quincena.
+    # Si hubiera dos planillas del mismo periodo, cuenta una sola: cerrada > aprobada > calculada > borrador.
     if cfg.metodo_renta == "monthly_consolidated" and ultima:
-        for b in conn.execute("""select b.base_cotizable, b.ccss_obrero, b.renta, b.creditos_renta
+        for b in conn.execute("""select distinct on (p.desde, p.hasta) b.base_cotizable, b.ccss_obrero, b.renta, b.creditos_renta
                                    from boletas b join planillas p on p.id = b.planilla_id
                                   where b.empleado_id = %s and p.id <> %s and p.tipo = 'ordinaria'
-                                    and p.estado in ('aprobada','cerrada')
-                                    and date_trunc('month', p.hasta) = date_trunc('month', %s::date)""",
-                              (eid, pl["id"], h)).fetchall():
+                                    and p.frecuencia = %s and p.hasta < %s
+                                    and date_trunc('month', p.hasta) = date_trunc('month', %s::date)
+                                  order by p.desde, p.hasta,
+                                           array_position(array['cerrada','aprobada','calculada','borrador'], p.estado),
+                                           p.creado_en""",
+                              (eid, pl["id"], pl["frecuencia"], d, h)).fetchall():
             e.boletas_anteriores_mes.append(M.BoletaAnterior(b["base_cotizable"], b["ccss_obrero"], b["renta"],
                                                              b["creditos_renta"]))
     return e, refs
@@ -242,6 +250,44 @@ def advertencias_de(emp: dict, res: M.ResultadoBoleta) -> list[dict]:
     return av
 
 
+def detectar_horas_extra(conn: Conexion, pl: dict, empleados: list[dict]) -> int:
+    """Configuración › Planilla › «Horas extra desde las marcas» (como el módulo Odoo).
+    Por cada colaborador y día del periodo: horas marcadas por encima de su jornada diaria,
+    si pasan de la tolerancia, quedan como hora extra PENDIENTE de aprobar (no se pagan solas).
+    Una por día (índice horas_extra_automatica_dia): recalcular no las duplica."""
+    cfg = conn.execute("""select he_desde_asistencia, tolerancia_tardia_min, factor_he_diurna
+                            from configuracion_planilla where empresa_id = %s""", (pl["empresa_id"],)).fetchone()
+    if not cfg or not cfg["he_desde_asistencia"]:
+        return 0
+    tolerancia = Decimal(cfg["tolerancia_tardia_min"]) / 60
+    nuevas = 0
+    for emp in empleados:
+        if emp["por_asistencia"]:
+            continue                              # a quien se le paga por hora, las horas ya son su salario
+        jornada = Decimal("8")
+        if emp.get("horario_id"):
+            h = conn.execute("select horas_diarias from tipos_horario where id = %s", (emp["horario_id"],)).fetchone()
+            if h:
+                jornada = Decimal(h["horas_diarias"])
+        tarifa = r2(Decimal(emp["salario_mensual"]) / 30 / jornada) if jornada else CERO
+        for d in conn.execute("""select (entrada at time zone 'America/Costa_Rica')::date as dia,
+                                        sum(extract(epoch from (salida - entrada)) / 3600) as horas
+                                   from marcas_asistencia where empleado_id = %s and salida is not null
+                                    and (entrada at time zone 'America/Costa_Rica')::date between %s and %s
+                                  group by 1""", (emp["id"], pl["desde"], pl["hasta"])).fetchall():
+            extra = r2(Decimal(str(d["horas"])) - jornada)
+            if extra <= tolerancia or extra <= 0:
+                continue
+            factor = Decimal(cfg["factor_he_diurna"])
+            nuevas += conn.execute("""insert into horas_extra (empresa_id, empleado_id, fecha, horas, tipo, factor, tarifa_hora,
+                                         monto, origen, estado)
+                                      values (%s,%s,%s,%s,'diurna',%s,%s,%s,'automatico','pendiente')
+                                      on conflict (empleado_id, fecha) where origen = 'automatico' do nothing""",
+                                   (pl["empresa_id"], emp["id"], d["dia"], extra, factor, tarifa,
+                                    r2(extra * tarifa * factor))).rowcount
+    return nuevas
+
+
 def calcular_planilla(conn: Conexion, planilla_id) -> dict:
     pl = conn.execute("select * from planillas where id = %s for update", (planilla_id,)).fetchone()
     if not pl:
@@ -261,8 +307,17 @@ def calcular_planilla(conn: Conexion, planilla_id) -> dict:
                                    "ins_patronal", "rop_patronal", "provisiones", "costo_total_patrono",
                                    "subsidio_ccss", "embargos")}
     advertencias: list[dict] = []
+    empleados = empleados_de_planilla(conn, pl)
+    detectadas = detectar_horas_extra(conn, pl, empleados)
+    pendientes = conn.execute("""select count(*) as n from horas_extra where empresa_id = %s and origen = 'automatico'
+                                   and estado = 'pendiente' and fecha between %s and %s""",
+                              (pl["empresa_id"], pl["desde"], pl["hasta"])).fetchone()["n"]
+    if pendientes:
+        advertencias.append({"nivel": "aviso", "mensaje":
+            f"Hay {pendientes} día(s) con horas extra detectadas en las marcas ({detectadas} nuevas) pendientes de aprobar. "
+            "Apruébelas en Novedades › Horas extra y recalcule para pagarlas en esta planilla."})
     n = 0
-    for emp in empleados_de_planilla(conn, pl):
+    for emp in empleados:
         entrada, refs = armar_entrada(conn, pl, emp, cfg)
         res = M.calcular_boleta(entrada, p)
         n += 1

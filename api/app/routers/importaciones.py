@@ -348,7 +348,19 @@ FRECUENCIAS = {"Mensual": "monthly", "Quincenal": "biweekly", "Semanal": "weekly
 TIPOS_ID = {"Cédula": "cedula", "Cédula nacional": "cedula", "Cédula CR": "cedula", "Física": "cedula",
             "DIMEX": "dimex", "Residencia": "dimex", "Pasaporte": "pasaporte", "NITE": "nite", "Otro": "otro",
             "Permiso": "otro", "cedula": "cedula", "dimex": "dimex", "pasaporte": "pasaporte", "nite": "nite",
-            "otro": "otro"}
+            "otro": "otro", "Permiso de Trabajo": "otro", "Indocumentado": "otro"}
+TIPOS_EMPLEADO = {"Indefinido": "indefinido", "Empleado Indefinido": "indefinido", "Plazo fijo": "plazo_fijo",
+                  "Empleado Plazo Fijo": "plazo_fijo", "Período de prueba": "periodo_prueba",
+                  "Periodo de prueba": "periodo_prueba", "Practicante": "practicante",
+                  "Servicios profesionales": "servicios_profesionales", "Ocasional": "ocasional",
+                  "Tiempo parcial": "tiempo_parcial", **{v: v for v in ("indefinido", "plazo_fijo", "periodo_prueba",
+                  "practicante", "servicios_profesionales", "ocasional", "tiempo_parcial")}}
+TIPOS_CUENTA = {"Cuenta Corriente": "corriente", "Corriente": "corriente", "Cuenta de Ahorros": "ahorros",
+                "Ahorros": "ahorros", "SINPE Móvil": "sinpe", "SINPE": "sinpe", "corriente": "corriente",
+                "ahorros": "ahorros", "sinpe": "sinpe"}
+ESTADOS_EMP = {"Activo": "activo", "Inactivo": "inactivo", "Liquidado": "liquidado", "Despedido": "inactivo",
+               "Renuncia": "inactivo", "Pensionado": "inactivo", "Incapacitado": "activo",
+               "Licencia sin goce": "activo", "Vacaciones": "activo", "Permiso": "activo"}
 CLASES = {"I": "I", "II": "II", "III": "III", "IV": "IV", "V": "V"}
 
 
@@ -382,6 +394,14 @@ class Estado:
             self.sucursales[norm(s["nombre"])] = s
             if s["codigo"]:
                 self.sucursales.setdefault(norm(s["codigo"]), s)
+        self.horarios = {norm(h["nombre"]): h for h in self.conn.execute(
+            "select * from tipos_horario where empresa_id = %s", (self.ctx.empresa_id,)).fetchall()}
+        self.tipos_empleado: dict[str, dict] = {}
+        for t in self.conn.execute("select * from tipos_empleado where empresa_id = %s", (self.ctx.empresa_id,)).fetchall():
+            self.tipos_empleado[norm(t["nombre"])] = t
+            self.tipos_empleado.setdefault(norm(t["codigo"]), t)
+        self.calendarios = {norm(c["nombre"]): c for c in self.conn.execute(
+            "select * from calendarios_pago where empresa_id = %s", (self.ctx.empresa_id,)).fetchall()}
         self.vistos = set()
 
     def empleado(self, d: dict) -> str | None:
@@ -424,19 +444,24 @@ COLS_EMPLEADOS = [
     Col("fecha_nacimiento", "Fecha de nacimiento", "fecha", ejemplo="15/05/1990"),
     Col("fecha_ingreso", "Fecha de ingreso", "fecha", al_crear=True, ejemplo="01/03/2020"),
     Col("fecha_salida", "Fecha de salida", "fecha", ayuda="Solo si ya no labora"),
-    Col("estado", "Estado", "opcion", opciones={"Activo": "activo", "Inactivo": "inactivo", "Liquidado": "liquidado"},
+    Col("estado", "Estado", "opcion", alias=("estado del empleado",), opciones=ESTADOS_EMP,
         ayuda="Por defecto Activo (Inactivo si tiene fecha de salida)"),
     Col("activo", "Activo en Odoo", "bool", interna=True),
     Col("sucursal", "Sucursal", ayuda="Nombre o código de una sucursal ya creada en Planilla Costa Rica"),
     Col("puesto", "Puesto", alias=("puesto cargo", "cargo", "job_title"), ejemplo="Bodeguero"),
-    Col("frecuencia", "Frecuencia de pago", "opcion", alias=("calendarizacion de planilla", "frecuencia"),
+    Col("frecuencia", "Frecuencia de pago", "opcion", alias=("frecuencia",),
         opciones=FRECUENCIAS, ayuda="Mensual, Quincenal, Semanal o Bimensual (por defecto Quincenal)",
         ejemplo="Quincenal"),
     Col("calendario", "Calendario Odoo", interna=True),
+    Col("calendarizacion", "Calendario de pago", alias=("calendarizacion de planilla", "calendarizacion"),
+        ayuda="Nombre de un calendario creado en Configuración (o Mensual, Quincenal, Semanal)"),
+    Col("horario", "Horario", alias=("tipo de horario",), ayuda="Nombre de un horario creado en Configuración › Horarios"),
     Col("salario_mensual", "Salario mensual", "dinero", al_crear=True, alias=("salario", "salario base", "base_salary"),
         ayuda="Salario mensual bruto, sin comas de miles", ejemplo="650000"),
     Col("por_asistencia", "Pago por asistencia", "bool", alias=("por horas",), ayuda="Sí si se paga por horas marcadas"),
-    Col("metodo", "Método Odoo", interna=True),
+    Col("metodo", "Método de cálculo", "opcion", alias=("metodo de calculo",),
+        opciones={"Salario Fijo": "fixed", "Por Horas Trabajadas": "attendance", "Por horas": "attendance",
+                  "fixed": "fixed", "attendance": "attendance"}, interna=True),
     Col("tarifa_hora", "Tarifa por hora", "dinero", alias=("hourly_rate",)),
     Col("medio_tiempo", "Medio tiempo", "bool"),
     Col("aplica_rop", "Aplica ROP", "bool", alias=("rop",)),
@@ -454,11 +479,23 @@ COLS_EMPLEADOS = [
     Col("iban", "Cuenta IBAN", alias=("iban", "cuenta bancaria iban", "cuenta bancaria", "bank_iban"),
         ayuda="CR + 20 dígitos", ejemplo="CR05015202001026284066"),
     Col("saldo_vacaciones", "Saldo de vacaciones (días)", "numero", alias=("saldo vacaciones",)),
+    Col("numero_ccss", "Número CCSS", alias=("numero de asegurado",)),
+    Col("asegurado_ccss", "Asegurado CCSS", "bool", ayuda="Por defecto Sí. No = sin cargas sociales ni reporte SICERE"),
+    Col("tipo_empleado", "Tipo de colaborador", alias=("tipo de empleado",),
+        ayuda="Uno de Configuración › Tipos de colaborador (por ejemplo Empleado Indefinido)"),
+    Col("departamento", "Departamento"),
+    Col("subdepartamento", "Subdepartamento", alias=("sub departamento",)),
+    Col("salario_variable", "Salario variable", "bool"),
+    Col("cuenta_bancaria", "Número de cuenta", alias=("numero de cuenta", "cuenta local")),
+    Col("tipo_cuenta", "Tipo de cuenta", "opcion", alias=("tipo de cuenta banco",), opciones=TIPOS_CUENTA),
+    Col("sinpe_movil", "SINPE Móvil", alias=("sinpe movil",)),
 ]
 CAMPOS_EMPLEADO = ["tipo_identificacion", "nombre", "apellidos", "correo", "telefono", "fecha_nacimiento",
                    "fecha_ingreso", "fecha_salida", "estado", "puesto", "frecuencia", "por_asistencia", "tarifa_hora",
                    "medio_tiempo", "aplica_rop", "hijos", "conyuge", "num_empleadores", "pensionado", "exento",
-                   "clase_riesgo_ins", "banco", "iban", "saldo_vacaciones"]
+                   "clase_riesgo_ins", "banco", "iban", "saldo_vacaciones", "numero_ccss", "asegurado_ccss",
+                   "tipo_empleado", "departamento", "subdepartamento", "salario_variable", "cuenta_bancaria",
+                   "tipo_cuenta", "sinpe_movil", "horario_id", "calendario_id"]
 
 
 def _partir_nombre(completo: str) -> tuple[str, str]:
@@ -509,6 +546,42 @@ def validar_empleado(est: Estado, d: dict) -> list[tuple[str, str]]:
         d["estado"] = "inactivo" if inactivo else "activo"
     if d.get("por_asistencia") and not d.get("tarifa_hora"):
         err.append(("tarifa_hora", "Un colaborador por asistencia necesita tarifa por hora"))
+    if d.get("iban") and not d["iban"].replace(" ", "").upper().startswith("CR") \
+            and re.fullmatch(r"[\d\s-]+", d["iban"]):
+        # «Cuenta Bancaria / IBAN» del machote Odoo: un número sin CR es la cuenta local
+        d["cuenta_bancaria"], d["iban"] = d.get("cuenta_bancaria") or re.sub(r"\D", "", d["iban"]), None
+    if d.get("sinpe_movil"):
+        d["sinpe_movil"] = re.sub(r"\D", "", d["sinpe_movil"])
+        if len(d["sinpe_movil"]) != 8:
+            err.append(("sinpe_movil", "El SINPE Móvil debe tener 8 dígitos"))
+    if d.get("tipo_empleado"):
+        t = est.tipos_empleado.get(norm(d["tipo_empleado"])) or est.tipos_empleado.get(
+            norm(TIPOS_EMPLEADO.get(d["tipo_empleado"], "")))
+        if t:
+            d["tipo_empleado"] = t["codigo"]
+            if not t["cotiza_ccss"] and d.get("asegurado_ccss") is None:
+                d["asegurado_ccss"] = False
+        else:
+            err.append(("tipo_empleado", f"No existe el tipo de colaborador «{d['tipo_empleado']}»: créelo en "
+                                         "Configuración › Tipos de colaborador"))
+    if d.get("horario"):
+        h = est.horarios.get(norm(d["horario"]))
+        if h:
+            d["horario_id"] = h["id"]
+        else:
+            err.append(("horario", f"No existe el horario «{d['horario']}»: créelo en Configuración › Horarios"))
+    if d.get("calendarizacion"):
+        c = est.calendarios.get(norm(d["calendarizacion"]))
+        if c:
+            d["calendario_id"], d["frecuencia"] = c["id"], c["frecuencia"]
+        else:
+            txt = str(d["calendarizacion"])
+            f = FRECUENCIAS.get(txt) or next((v for k, v in FRECUENCIAS.items()
+                                              if norm(k) == norm(txt.split()[0] if txt.split() else "")), None)
+            if f:
+                d["frecuencia"] = f
+            else:
+                err.append(("calendarizacion", f"No existe el calendario «{txt}» (use Mensual, Quincenal o Semanal)"))
     if d.get("iban"):
         d["iban"] = d["iban"].replace(" ", "").replace("-", "").upper()
         if not iban_valido(d["iban"]):
@@ -562,6 +635,14 @@ def _campos_a_actualizar(d: dict) -> set[str]:
         pres.add("telefono")
     if "metodo" in pres:
         pres.add("por_asistencia")
+    if "tipo_empleado" in pres:
+        pres.add("asegurado_ccss")
+    if "horario" in pres:
+        pres.add("horario_id")
+    if "calendarizacion" in pres:
+        pres |= {"calendario_id", "frecuencia"}
+    if "iban" in pres:
+        pres.add("cuenta_bancaria")
     return pres
 
 
@@ -1691,6 +1772,10 @@ def diagnostico(ctx: Contexto = Depends(contexto_empresa)) -> list[dict]:
                             (ini_ag, ctx.empresa_id)).fetchall()
     if not emps:
         add("aviso", "empleados", "No hay colaboradores activos")
+    minimos = ctx.conn.execute("""select categoria, monto from salarios_minimos
+                                   where vigente_desde = (select max(vigente_desde) from salarios_minimos
+                                                           where vigente_desde <= %s)
+                                   order by monto limit 1""", (hoy,)).fetchall()
     for x in emps:
         n = f"{x['nombre']} {x['apellidos']}".strip()
         dig = re.sub(r"\D", "", x["identificacion"])
@@ -1709,6 +1794,11 @@ def diagnostico(ctx: Contexto = Depends(contexto_empresa)) -> list[dict]:
             add("error", "salario", f"{n}: se paga por asistencia pero no tiene tarifa por hora", x["id"])
         elif not x["por_asistencia"] and not Decimal(x["salario_mensual"]):
             add("error", "salario", f"{n}: salario mensual en cero", x["id"])
+        minimo = minimos[0] if minimos else None
+        if (minimo and not x["por_asistencia"] and not x["medio_tiempo"] and x["asegurado_ccss"]
+                and Decimal(x["salario_mensual"]) and Decimal(x["salario_mensual"]) < minimo["monto"]):
+            add("aviso", "salario", f"{n}: el salario ({x['salario_mensual']}) es menor que el mínimo más bajo del MTSS "
+                                    f"({minimo['categoria']}: {minimo['monto']})", x["id"])
         if not x["fecha_nacimiento"]:
             add("info", "datos", f"{n}: sin fecha de nacimiento (se usa para la base mínima reducida)", x["id"])
         if Decimal(x["saldo_vacaciones"]) < 0:
@@ -1717,6 +1807,8 @@ def diagnostico(ctx: Contexto = Depends(contexto_empresa)) -> list[dict]:
             add("aviso", "estado", f"{n}: tiene fecha de salida {x['fecha_salida']:%d/%m/%Y} pero sigue activo", x["id"])
         # Historial para aguinaldo y promedios: meses con boleta desde el 1 de diciembre
         inicio = max(x["fecha_ingreso"], ini_ag)
+        if x["aguinaldo_corte"] and x["aguinaldo_corte"] >= inicio and Decimal(x["aguinaldo_inicial"]) > 0:
+            inicio = x["aguinaldo_corte"] + timedelta(days=1)       # lo anterior viene en el aguinaldo acumulado
         esperados = (hoy.year - inicio.year) * 12 + hoy.month - inicio.month
         if esperados >= 1 and x["meses_boletas"] < esperados:
             add("aviso", "historico",

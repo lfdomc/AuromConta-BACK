@@ -650,6 +650,8 @@ def crear_cliente(datos: ClienteIn, conn=Depends(admin_plataforma)) -> dict:
         with conn.transaction():
             c = crud.insertar(conn, "negocio.clientes", d)
     except psycopg.errors.UniqueViolation as exc:
+        if exc.diag.constraint_name == "clientes_identificacion_unica":
+            raise HTTPException(409, "Ya existe un cliente con esa identificación.") from exc
         raise HTTPException(409, "Esa empresa ya tiene ficha de cliente") from exc
     _alinear_inicio_planilla(conn, c)
     return _cliente_con_precio(conn, c)

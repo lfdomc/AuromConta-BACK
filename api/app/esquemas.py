@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Literal
+from typing import Annotated, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -60,6 +60,35 @@ class ConfiguracionIn(Base):
     factor_he_doble: Decimal | None = None
     correo_remitente: str | None = None
     nota_boleta: str | None = None
+    # Pago bancario (BAC Formato 6)
+    bac_plan: str | None = Field(None, max_length=10)
+    bac_envio: int | None = Field(None, ge=1, le=99999)
+    bac_concepto: str | None = Field(None, max_length=30)
+    # Asistencia y horas extra
+    he_desde_asistencia: bool | None = None
+    tolerancia_tardia_min: int | None = Field(None, ge=0, le=240)
+    # Asiento contable
+    asiento_modo: Literal["planilla", "empleado"] | None = None
+    # Correo de boletas
+    correo_asunto: str | None = Field(None, max_length=200)
+    correo_cuerpo: str | None = Field(None, max_length=5000)
+    correo_firma: str | None = Field(None, max_length=200)
+    # Firmante de constancias
+    firmante_nombre: str | None = Field(None, max_length=120)
+    firmante_cargo: str | None = Field(None, max_length=120)
+    firmante_telefono: str | None = Field(None, max_length=40)
+    firmante_correo: str | None = Field(None, max_length=120)
+    firmante_lugar: str | None = Field(None, max_length=120)
+    # Boleta, liquidaciones y vacaciones
+    boleta_saldo_vacaciones: bool | None = None
+    boleta_detalle_subsidio: bool | None = None
+    liquidacion_sin_ccss: bool | None = None
+    vacaciones_excluir_incapacidad: bool | None = None
+    vacaciones_dias_aniversario: Decimal | None = Field(None, ge=1, le=15)
+    # Alertas de documentos
+    alertas_documentos_correos: str | None = Field(None, max_length=500)
+    alertas_documentos_frecuencia: Literal["semanal", "mensual"] | None = None
+    alertas_documentos_dias: int | None = Field(None, ge=1, le=365)
 
 
 class UsuarioEmpresaIn(Base):
@@ -103,6 +132,52 @@ class CalendarioIn(Base):
     activo: bool = True
 
 
+TipoEmpleado = Annotated[str, Field(min_length=1, max_length=40)]   # código del catálogo tipos_empleado
+
+
+class TipoEmpleadoIn(Base):
+    codigo: str = Field(min_length=1, max_length=40, pattern=r"^[a-z0-9_]+$")
+    nombre: str = Field(min_length=1, max_length=80)
+    cotiza_ccss: bool = True
+    activo: bool = True
+
+
+class TipoDocumentoIn(Base):
+    nombre: str = Field(min_length=1, max_length=120)
+    requiere_numero: bool = False
+    requiere_vencimiento: bool = True
+    dias_alerta: int | None = Field(None, ge=1, le=365)
+    orden: int = 100
+
+
+class TipoCobroIn(Base):
+    nombre: str = Field(min_length=1, max_length=120)
+    modo: Literal["fijo", "por_unidad"] = "fijo"
+    precio_unitario: Dinero = Field(Decimal("0"), ge=0)
+    unidad: str | None = Field(None, max_length=30)
+    subsidio_pct: Decimal = Field(Decimal("0"), ge=0, le=100)
+    afecta_ccss: bool = False
+    activo: bool = True
+    orden: int = 100
+
+
+class BonoAntiguedadIn(Base):
+    nombre: str = Field(min_length=1, max_length=120)
+    desde_anios: int = Field(ge=1, le=60)
+    hasta_anios: int | None = Field(None, ge=1, le=60)
+    tipo: Literal["porcentaje", "fijo"] = "porcentaje"
+    porcentaje: Decimal | None = Field(None, gt=0, le=100)
+    monto: Dinero | None = Field(None, gt=0)
+    activo: bool = True
+
+
+class SalarioMinimoIn(Base):
+    categoria: str = Field(min_length=1, max_length=120)
+    monto: Dinero = Field(gt=0)
+    vigente_desde: date
+    decreto: str | None = Field(None, max_length=200)
+
+
 class HorarioIn(Base):
     nombre: str
     horas_diarias: Decimal = Decimal("8")
@@ -118,6 +193,8 @@ class FeriadoIn(Base):
 
 
 # ------------------------------------------------------------- Empleados ----
+
+
 class EmpleadoIn(Base):
     tipo_identificacion: Literal["cedula", "dimex", "pasaporte", "nite", "otro"] = "cedula"
     identificacion: str
@@ -148,6 +225,19 @@ class EmpleadoIn(Base):
     banco: str | None = None
     iban: str | None = None
     saldo_vacaciones: Decimal = Decimal("0")
+    numero_ccss: str | None = Field(None, max_length=30)
+    asegurado_ccss: bool = True
+    tipo_empleado: TipoEmpleado = "indefinido"
+    departamento: str | None = Field(None, max_length=80)
+    subdepartamento: str | None = Field(None, max_length=80)
+    salario_variable: bool = False
+    cuenta_bancaria: str | None = Field(None, max_length=40)
+    tipo_cuenta: Literal["corriente", "ahorros", "sinpe"] | None = None
+    sinpe_movil: str | None = Field(None, pattern=r"^\d{8}$")
+    aguinaldo_inicial: Dinero = Decimal("0")
+    aguinaldo_corte: date | None = None
+    vacaciones_saldo_inicial: Decimal | None = Field(None, ge=0, le=999)
+    vacaciones_corte: date | None = None
 
 
 class EmpleadoUpd(Base):
@@ -180,6 +270,19 @@ class EmpleadoUpd(Base):
     banco: str | None = None
     iban: str | None = None
     saldo_vacaciones: Decimal | None = None
+    numero_ccss: str | None = Field(None, max_length=30)
+    asegurado_ccss: bool | None = None
+    tipo_empleado: TipoEmpleado | None = None
+    departamento: str | None = Field(None, max_length=80)
+    subdepartamento: str | None = Field(None, max_length=80)
+    salario_variable: bool | None = None
+    cuenta_bancaria: str | None = Field(None, max_length=40)
+    tipo_cuenta: Literal["corriente", "ahorros", "sinpe"] | None = None
+    sinpe_movil: str | None = Field(None, pattern=r"^\d{8}$")
+    aguinaldo_inicial: Dinero | None = None
+    aguinaldo_corte: date | None = None
+    vacaciones_saldo_inicial: Decimal | None = Field(None, ge=0, le=999)
+    vacaciones_corte: date | None = None
 
 
 class CambioSalarialIn(Base):

@@ -218,7 +218,8 @@ def _cuenta_para(conn: Conexion, empresa_id, codigo: str, nombre: str, concepto:
     return nueva["id"]
 
 
-def desde_planilla(conn: Conexion, planilla: dict, lineas_planilla: list[dict]) -> dict | None:
+def desde_planilla(conn: Conexion, planilla: dict, lineas_planilla: list[dict], descripcion: str | None = None,
+                   limpiar: bool = True) -> dict | None:
     """Pasa el asiento de una planilla cerrada al diario de Planillas (PLA).
 
     `lineas_planilla`: [{concepto, codigo, nombre, descripcion, debito, credito}]. Las cuentas se
@@ -228,7 +229,8 @@ def desde_planilla(conn: Conexion, planilla: dict, lineas_planilla: list[dict]) 
     empresa_id = planilla["empresa_id"]
     if not activo(conn, empresa_id):
         return None
-    for viejo in conn.execute(
+    # Con «un asiento por boleta» se llama una vez por boleta: solo la primera limpia los anteriores.
+    for viejo in [] if not limpiar else conn.execute(
             """select id, estado from contabilidad.asientos where empresa_id = %s and origen_id = %s
                  and origen in ('planilla','aguinaldo') and estado in ('borrador','contabilizado')""",
             (empresa_id, planilla["id"])).fetchall():
@@ -254,7 +256,7 @@ def desde_planilla(conn: Conexion, planilla: dict, lineas_planilla: list[dict]) 
         avisos.append("El periodo contable está cerrado: el asiento quedó en borrador.")
     tipo = "aguinaldo" if planilla["tipo"] == "aguinaldo" else "planilla"
     return crear(conn, empresa_id, diario=diario_id(conn, empresa_id, "PLA"), fecha=fecha,
-                 descripcion=f"Planilla {planilla['tipo']} del {planilla['desde']:%d/%m/%Y} al {planilla['hasta']:%d/%m/%Y}",
+                 descripcion=descripcion or f"Planilla {planilla['tipo']} del {planilla['desde']:%d/%m/%Y} al {planilla['hasta']:%d/%m/%Y}",
                  lineas=lineas, referencia=f"Planilla {str(planilla['id'])[:8]}", origen=tipo, origen_id=planilla["id"],
                  advertencia=" ".join(avisos) or None, contabilizar_ya=abierto)
 

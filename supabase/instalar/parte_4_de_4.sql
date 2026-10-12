@@ -801,6 +801,11 @@ begin
   if v_emp is null or v_emp.estado_servicio = 'baja' then return; end if;
   v_ced := regexp_replace(coalesce(v_emp.cedula_juridica, ''), '\D', '', 'g');
   if v_ced = '' then return; end if;                      -- sin cédula no se puede facturar todavía
+  -- Si ya existe un cliente con esa cédula creado a mano (sin empresa), se vincula en vez de duplicarlo.
+  update negocio.clientes set empresa_id = p_empresa
+   where empresa_id is null and estado <> 'baja'
+     and regexp_replace(coalesce(identificacion, ''), '\D', '', 'g') = v_ced;
+  if found then return; end if;
   v_correo := nullif(trim(coalesce(v_emp.correo, '')), '');
   if v_correo is null then
     select u.email into v_correo from auth.users u where u.id = v_emp.creado_por;
@@ -810,7 +815,8 @@ begin
                                 telefono, estado, alta)
   values (p_empresa, v_emp.nombre,
           case when length(v_ced) = 9 then '01' when length(v_ced) in (11, 12) then '03' else '02' end,
-          v_ced, v_correo, v_emp.telefono, v_emp.estado_servicio, v_emp.creado_en::date);
+          v_ced, v_correo, v_emp.telefono, v_emp.estado_servicio, v_emp.creado_en::date)
+  on conflict do nothing;   -- si otra ficha vigente ya usa esa identificación, no se bloquea el registro
 end $$;
 revoke all on function negocio.asegurar_ficha_cliente(uuid) from public, anon, authenticated;
 
@@ -897,6 +903,361 @@ begin
 end $$;
 revoke execute on function public.crear_empresa(text, text, text, text, text[]) from public, anon;
 grant execute on function public.crear_empresa(text, text, text, text, text[]) to authenticated;
+
+
+-- ===== 20261012001800_identificaciones_unicas.sql =====
+-- Sin duplicados de identificación. Se compara sin guiones ni espacios: «3-101-123456» = «3101123456».
+--   * Empresas: una sola empresa vigente por cédula jurídica (las dadas de baja no cuentan).
+--   * Colaboradores: una sola vez por empresa (la misma persona sí puede estar en otra empresa).
+--   * Clientes del negocio: una sola ficha vigente por identificación.
+-- Si ya hay duplicados, la migración se detiene y dice cuáles son, para corregirlos antes.
+
+create or replace function public.ident_normal(p text) returns text
+language sql immutable parallel safe set search_path = '' as $$
+  select nullif(regexp_replace(upper(coalesce(p, '')), '[^0-9A-Z]', '', 'g'), '')
+$$;
+revoke all on function public.ident_normal(text) from public, anon;
+grant execute on function public.ident_normal(text) to authenticated, service_role;
+
+do $$
+declare v text;
+begin
+  select string_agg(format('%s (%s)', d.ced, d.nombres), '; ') into v from (
+    select public.ident_normal(cedula_juridica) as ced, string_agg(nombre, ', ') as nombres
+      from public.empresas where estado_servicio <> 'baja' and public.ident_normal(cedula_juridica) is not null
+     group by 1 having count(*) > 1) d;
+  if v is not null then
+    raise exception 'Hay empresas vigentes con la misma cédula: %. Dé de baja o borre la duplicada y vuelva a correr este archivo.', v;
+  end if;
+
+  select string_agg(format('%s en %s', d.ident, d.empresa), '; ') into v from (
+    select public.ident_normal(e.identificacion) as ident, em.nombre as empresa
+      from public.empleados e join public.empresas em on em.id = e.empresa_id
+     group by e.empresa_id, em.nombre, 1 having count(*) > 1) d;
+  if v is not null then
+    raise exception 'Hay colaboradores repetidos en la misma empresa: %. Corrija uno de ellos y vuelva a correr este archivo.', v;
+  end if;
+
+  select string_agg(d.ident, ', ') into v from (
+    select public.ident_normal(identificacion) as ident from negocio.clientes
+     where estado <> 'baja' and public.ident_normal(identificacion) is not null
+     group by 1 having count(*) > 1) d;
+  if v is not null then
+    raise exception 'Hay clientes vigentes con la misma identificación: %. Dé de baja el duplicado y vuelva a correr este archivo.', v;
+  end if;
+end $$;
+
+create unique index if not exists empresas_cedula_unica
+  on public.empresas (public.ident_normal(cedula_juridica))
+  where estado_servicio <> 'baja' and public.ident_normal(cedula_juridica) is not null;
+
+create unique index if not exists empleados_identificacion_unica
+  on public.empleados (empresa_id, public.ident_normal(identificacion));
+
+create unique index if not exists clientes_identificacion_unica
+  on negocio.clientes (public.ident_normal(identificacion))
+  where estado <> 'baja' and public.ident_normal(identificacion) is not null;
+
+-- ===== 20261012001900_configuracion_planilla_completa.sql =====
+-- Opciones de planilla por empresa, equivalentes a la «Configuración Contable de Planilla CR» del módulo Odoo.
+
+alter table public.configuracion_planilla
+  -- Pago bancario: BAC Macro Pago Planilla Formato 6
+  add column if not exists bac_plan text,
+  add column if not exists bac_envio int not null default 1 check (bac_envio between 1 and 99999),
+  add column if not exists bac_concepto text not null default 'Pago de Planilla',
+  -- Asistencia y horas extra
+  add column if not exists he_desde_asistencia boolean not null default false,
+  add column if not exists tolerancia_tardia_min int not null default 15 check (tolerancia_tardia_min between 0 and 240),
+  -- Asiento contable: uno por planilla (consolidado) o uno por boleta
+  add column if not exists asiento_modo text not null default 'planilla' check (asiento_modo in ('planilla','empleado')),
+  -- Correo de boletas ({periodo}, {empresa}, {colaborador})
+  add column if not exists correo_asunto text,
+  add column if not exists correo_cuerpo text,
+  add column if not exists correo_firma text,
+  -- Firmante de constancias laborales
+  add column if not exists firmante_nombre text,
+  add column if not exists firmante_cargo text,
+  add column if not exists firmante_telefono text,
+  add column if not exists firmante_correo text,
+  add column if not exists firmante_lugar text,
+  -- Boleta en PDF
+  add column if not exists boleta_saldo_vacaciones boolean not null default false,
+  add column if not exists boleta_detalle_subsidio boolean not null default false,
+  -- Liquidaciones
+  add column if not exists liquidacion_sin_ccss boolean not null default false,
+  -- Vacaciones
+  add column if not exists vacaciones_excluir_incapacidad boolean not null default false,
+  add column if not exists vacaciones_dias_aniversario numeric(5,2) check (vacaciones_dias_aniversario is null or vacaciones_dias_aniversario between 1 and 15),
+  -- Alertas de documentos de colaboradores por vencer
+  add column if not exists alertas_documentos_correos text,
+  add column if not exists alertas_documentos_frecuencia text not null default 'mensual'
+    check (alertas_documentos_frecuencia in ('semanal','mensual')),
+  add column if not exists alertas_documentos_dias int not null default 30 check (alertas_documentos_dias between 1 and 365),
+  add column if not exists alertas_documentos_ultima date;
+
+-- Horas extra detectadas desde las marcas: una por colaborador y día (no se duplican al recalcular).
+create unique index if not exists horas_extra_automatica_dia
+  on public.horas_extra (empleado_id, fecha) where origen = 'automatico';
+
+-- El número de envío BAC avanza al exportar, aunque quien exporte no sea administrador.
+create or replace function public.avanzar_envio_bac(p_empresa uuid, p_usado int) returns void
+language plpgsql security definer set search_path = '' as $$
+begin
+  if not public.puede_operar(p_empresa) then raise exception 'Sin permiso'; end if;
+  update public.configuracion_planilla set bac_envio = greatest(bac_envio, p_usado) % 99999 + 1
+   where empresa_id = p_empresa;
+end $$;
+revoke all on function public.avanzar_envio_bac(uuid, int) from public, anon;
+grant execute on function public.avanzar_envio_bac(uuid, int) to authenticated;
+
+-- El portal del colaborador también respeta las opciones de la boleta (saldo de vacaciones, subsidio).
+drop function if exists public.portal_planillas();
+create function public.portal_planillas()
+returns table (planilla_id uuid, empresa_id uuid, empresa_nombre text, cedula_juridica text, tipo text,
+               desde date, hasta date, fecha_pago date, nota_boleta text,
+               boleta_saldo_vacaciones boolean, boleta_detalle_subsidio boolean)
+language sql stable security definer set search_path = public as $$
+  select distinct p.id, p.empresa_id, em.nombre, em.cedula_juridica, p.tipo, p.desde, p.hasta, p.fecha_pago, c.nota_boleta,
+         coalesce(c.boleta_saldo_vacaciones, false), coalesce(c.boleta_detalle_subsidio, false)
+    from boletas b
+    join empleados e on e.id = b.empleado_id and e.usuario_id = auth.uid()
+    join planillas p on p.id = b.planilla_id and p.estado = 'cerrada'
+    join empresas em on em.id = p.empresa_id
+    left join configuracion_planilla c on c.empresa_id = p.empresa_id
+   where auth.uid() is not null
+$$;
+revoke all on function public.portal_planillas() from public, anon;
+grant execute on function public.portal_planillas() to authenticated;
+
+
+-- ===== 20261012002000_ficha_colaborador_odoo.sql =====
+-- Ficha del colaborador con los datos de la pestaña «Planilla CR» del módulo Odoo.
+
+alter table public.empleados
+  -- CCSS
+  add column if not exists numero_ccss text,
+  add column if not exists asegurado_ccss boolean not null default true,      -- no asegurado = sin CCSS, renta ni INS (planilla SP de Odoo)
+  -- Clasificación
+  add column if not exists tipo_empleado text not null default 'indefinido'
+    check (tipo_empleado in ('indefinido','plazo_fijo','periodo_prueba','practicante','servicios_profesionales','ocasional','tiempo_parcial')),
+  add column if not exists departamento text,
+  add column if not exists subdepartamento text,
+  add column if not exists salario_variable boolean not null default false,   -- comisiones / HE recurrentes
+  -- Banco
+  add column if not exists cuenta_bancaria text,
+  add column if not exists tipo_cuenta text check (tipo_cuenta in ('corriente','ahorros','sinpe')),
+  add column if not exists sinpe_movil text,
+  -- Saldos al implementar el sistema (pre-implementación)
+  add column if not exists aguinaldo_inicial numeric(14,2) not null default 0 check (aguinaldo_inicial >= 0),
+  add column if not exists aguinaldo_corte date,
+  add column if not exists vacaciones_saldo_inicial numeric(8,2),
+  add column if not exists vacaciones_corte date;
+
+comment on column public.empleados.aguinaldo_inicial is
+  'Aguinaldo acumulado antes de usar el sistema (Art. 228 CT). Se suma al aguinaldo calculado desde el día siguiente a aguinaldo_corte.';
+comment on column public.empleados.vacaciones_saldo_inicial is
+  'Saldo de vacaciones a la fecha vacaciones_corte. Desde ahí se acumula 1 día por mes cumplido y se restan los días tomados.';
+
+-- Al guardar el saldo inicial de vacaciones en la ficha, quien opera la planilla recalcula
+-- las acreditaciones posteriores al corte.
+drop policy if exists operar_insertar on public.vacaciones_acumuladas;
+create policy operar_insertar on public.vacaciones_acumuladas for insert to authenticated
+  with check (public.puede_operar(empresa_id));
+drop policy if exists operar_borrar on public.vacaciones_acumuladas;
+create policy operar_borrar on public.vacaciones_acumuladas for delete to authenticated
+  using (public.puede_operar(empresa_id));
+grant insert, delete on public.vacaciones_acumuladas to authenticated;
+
+
+-- ===== 20261012002100_catalogos_odoo.sql =====
+-- Catálogos de Configuración como el menú del módulo Odoo, con datos predeterminados que
+-- cada empresa puede cambiar: horarios, tipos de colaborador, tipos de documento,
+-- tipos de cobro y tabla de bono de antigüedad. Salarios mínimos (MTSS) es global.
+
+-- ------------------------------------------------------------ Tipos de colaborador
+create table if not exists public.tipos_empleado (
+  id uuid primary key default gen_random_uuid(),
+  empresa_id uuid not null references public.empresas(id) on delete cascade,
+  codigo text not null,
+  nombre text not null,
+  cotiza_ccss boolean not null default true,     -- false = sin CCSS, renta ni INS (como «no asegurado»)
+  activo boolean not null default true,
+  unique (empresa_id, codigo)
+);
+do $$ begin
+  if not exists (select 1 from pg_policies where schemaname = 'public' and tablename = 'tipos_empleado') then
+    perform public._politicas_empresa('public.tipos_empleado');
+  end if;
+end $$;
+
+-- El tipo del colaborador pasa a ser el código de este catálogo (cada empresa puede agregar).
+alter table public.empleados drop constraint if exists empleados_tipo_empleado_check;
+
+-- ------------------------------------------------------------ Tipos de documento
+create table if not exists public.tipos_documento (
+  id uuid primary key default gen_random_uuid(),
+  empresa_id uuid not null references public.empresas(id) on delete cascade,
+  nombre text not null,
+  requiere_numero boolean not null default false,
+  requiere_vencimiento boolean not null default true,
+  dias_alerta int check (dias_alerta is null or dias_alerta between 1 and 365),   -- vacío = el de Configuración › Planilla
+  orden int not null default 100,
+  unique (empresa_id, nombre)
+);
+do $$ begin
+  if not exists (select 1 from pg_policies where schemaname = 'public' and tablename = 'tipos_documento') then
+    perform public._politicas_empresa('public.tipos_documento');
+  end if;
+end $$;
+
+-- ------------------------------------------------------------ Tipos de cobro al colaborador
+create table if not exists public.tipos_cobro (
+  id uuid primary key default gen_random_uuid(),
+  empresa_id uuid not null references public.empresas(id) on delete cascade,
+  nombre text not null,
+  modo text not null default 'fijo' check (modo in ('fijo', 'por_unidad')),
+  precio_unitario numeric(14,2) not null default 0 check (precio_unitario >= 0),
+  unidad text,
+  subsidio_pct numeric(5,2) not null default 0 check (subsidio_pct between 0 and 100),
+  afecta_ccss boolean not null default false,
+  activo boolean not null default true,
+  orden int not null default 100,
+  unique (empresa_id, nombre)
+);
+do $$ begin
+  if not exists (select 1 from pg_policies where schemaname = 'public' and tablename = 'tipos_cobro') then
+    perform public._politicas_empresa('public.tipos_cobro');
+  end if;
+end $$;
+
+-- ------------------------------------------------------------ Bono de antigüedad (tabla por tramos)
+create table if not exists public.bono_antiguedad (
+  id uuid primary key default gen_random_uuid(),
+  empresa_id uuid not null references public.empresas(id) on delete cascade,
+  nombre text not null,
+  desde_anios int not null check (desde_anios >= 1),
+  hasta_anios int check (hasta_anios is null or hasta_anios >= desde_anios),
+  tipo text not null default 'porcentaje' check (tipo in ('porcentaje', 'fijo')),
+  porcentaje numeric(6,2) check (porcentaje is null or porcentaje > 0),
+  monto numeric(14,2) check (monto is null or monto > 0),
+  activo boolean not null default true,
+  check ((tipo = 'porcentaje' and porcentaje is not null) or (tipo = 'fijo' and monto is not null))
+);
+do $$ begin
+  if not exists (select 1 from pg_policies where schemaname = 'public' and tablename = 'bono_antiguedad') then
+    perform public._politicas_empresa('public.bono_antiguedad');
+  end if;
+end $$;
+create index if not exists bono_antiguedad_empresa on public.bono_antiguedad (empresa_id);
+
+-- ------------------------------------------------------------ Salarios mínimos MTSS (global)
+create table if not exists public.salarios_minimos (
+  id uuid primary key default gen_random_uuid(),
+  categoria text not null,
+  monto numeric(14,2) not null check (monto > 0),
+  vigente_desde date not null,
+  decreto text,
+  unique (categoria, vigente_desde)
+);
+alter table public.salarios_minimos enable row level security;
+drop policy if exists ver on public.salarios_minimos;
+create policy ver on public.salarios_minimos for select to authenticated using (true);
+drop policy if exists gestionar on public.salarios_minimos;
+create policy gestionar on public.salarios_minimos for all to authenticated
+  using (public.es_admin_plataforma()) with check (public.es_admin_plataforma());
+grant select, insert, update, delete on public.salarios_minimos to authenticated;
+
+insert into public.salarios_minimos (categoria, monto, vigente_desde, decreto) values
+  ('Trabajador no calificado genérico', 384300, '2026-01-01', 'Decreto MTSS salarios mínimos 2026'),
+  ('Trabajador semicalificado', 399400, '2026-01-01', 'Decreto MTSS salarios mínimos 2026'),
+  ('Trabajador calificado', 430500, '2026-01-01', 'Decreto MTSS salarios mínimos 2026'),
+  ('Técnico de nivel medio', 521600, '2026-01-01', 'Decreto MTSS salarios mínimos 2026'),
+  ('Universitario con título', 736900, '2026-01-01', 'Decreto MTSS salarios mínimos 2026')
+on conflict do nothing;
+
+-- ------------------------------------------------------------ Datos predeterminados por empresa
+-- Igual que default_data.xml del módulo Odoo. Solo agrega lo que falta: no pisa lo que la empresa cambió.
+create or replace function public.sembrar_catalogos_empresa(p_empresa uuid) returns void
+language plpgsql security definer set search_path = '' as $$
+begin
+  insert into public.tipos_horario (empresa_id, nombre, horas_diarias, dias_semana, jornada, medio_tiempo)
+  select p_empresa, h.nombre, h.horas, h.dias, h.jornada, h.medio
+    from (values
+      ('Jornada Completa (8 horas - Lun a Vie)', 8.0, 5, 'diurna', false),
+      ('Jornada Completa (8 horas - Lun a Sáb)', 8.0, 6, 'diurna', false),
+      ('Jornada Mixta (7 horas)', 7.0, 6, 'mixta', false),
+      ('Jornada Nocturna (6 horas)', 6.0, 6, 'nocturna', false),
+      ('Jornada Acumulada 4x10 (10 horas - 4 días)', 10.0, 4, 'diurna', false),
+      ('Jornada Acumulada 3x12 (12 horas - 3 días)', 12.0, 3, 'diurna', false),
+      ('Medio Tiempo (4 horas)', 4.0, 5, 'diurna', true),
+      ('Tres Cuartos (6 horas)', 6.0, 5, 'diurna', true),
+      ('Horario de Confianza', 8.0, 5, 'diurna', false),
+      ('Guardias / Turnos 24 horas', 12.0, 3, 'mixta', false),
+      ('Turno Rotativo (Mañana / Tarde / Noche)', 8.0, 5, 'mixta', false),
+      ('Fines de Semana (Sáb y Dom)', 8.0, 2, 'diurna', false)
+    ) as h(nombre, horas, dias, jornada, medio)
+   where not exists (select 1 from public.tipos_horario t where t.empresa_id = p_empresa and t.nombre = h.nombre);
+
+  insert into public.tipos_empleado (empresa_id, codigo, nombre, cotiza_ccss)
+  values (p_empresa, 'indefinido', 'Empleado Indefinido', true),
+         (p_empresa, 'plazo_fijo', 'Empleado Plazo Fijo', true),
+         (p_empresa, 'periodo_prueba', 'Período de prueba', true),
+         (p_empresa, 'tiempo_parcial', 'Tiempo Parcial', true),
+         (p_empresa, 'practicante', 'Practicante', true),
+         (p_empresa, 'ocasional', 'Ocasional', true),
+         (p_empresa, 'servicios_profesionales', 'Servicios Profesionales', false)
+  on conflict (empresa_id, codigo) do nothing;
+
+  insert into public.tipos_documento (empresa_id, nombre, requiere_numero, requiere_vencimiento, dias_alerta, orden)
+  values (p_empresa, 'Cédula de Identidad / Residencia', true, true, 60, 10),
+         (p_empresa, 'Licencia de Conducir', true, true, 30, 20),
+         (p_empresa, 'Carné de Manipulación de Alimentos', true, true, 30, 30),
+         (p_empresa, 'Permiso de Trabajo (extranjeros)', true, true, 60, 40),
+         (p_empresa, 'Certificado Médico Ocupacional', false, true, 30, 50),
+         (p_empresa, 'Contrato Laboral', false, false, null, 60),
+         (p_empresa, 'Copia de Cédula', false, false, null, 70),
+         (p_empresa, 'Currículum', false, false, null, 80),
+         (p_empresa, 'Carta de Recomendación', false, false, null, 90)
+  on conflict (empresa_id, nombre) do nothing;
+
+  insert into public.tipos_cobro (empresa_id, nombre, modo, unidad, subsidio_pct, orden)
+  values (p_empresa, 'Almuerzo Comedor (Fijo Mensual)', 'fijo', 'período', 0, 10),
+         (p_empresa, 'Almuerzo Comedor (Por Días)', 'por_unidad', 'días', 0, 20),
+         (p_empresa, 'Almuerzo Subsidiado (Empresa y Empleado)', 'por_unidad', 'días', 50, 30),
+         (p_empresa, 'Productos / Mercadería', 'por_unidad', 'unidades', 0, 40),
+         (p_empresa, 'Uniforme / Equipo de Trabajo', 'fijo', 'kit', 0, 50),
+         (p_empresa, 'Parqueo / Estacionamiento', 'fijo', 'período', 0, 60),
+         (p_empresa, 'Seguro Colectivo Voluntario', 'fijo', 'período', 0, 70),
+         (p_empresa, 'Otro Cobro al Empleado', 'fijo', 'unidad', 0, 99)
+  on conflict (empresa_id, nombre) do nothing;
+end $$;
+revoke all on function public.sembrar_catalogos_empresa(uuid) from public, anon, authenticated;
+
+create or replace function public.tg_sembrar_catalogos() returns trigger
+language plpgsql security definer set search_path = '' as $$
+begin
+  perform public.sembrar_catalogos_empresa(new.id);
+  return new;
+end $$;
+revoke all on function public.tg_sembrar_catalogos() from public, anon, authenticated;
+
+drop trigger if exists empresa_catalogos on public.empresas;
+create trigger empresa_catalogos after insert on public.empresas
+  for each row execute function public.tg_sembrar_catalogos();
+
+-- Empresas que ya existen
+select public.sembrar_catalogos_empresa(id) from public.empresas;
+
+-- Restaurar los predeterminados que una empresa borró (botón en Configuración).
+create or replace function public.restaurar_catalogos(p_empresa uuid) returns void
+language plpgsql security definer set search_path = '' as $$
+begin
+  if not public.es_admin_empresa(p_empresa) then raise exception 'Sin permiso'; end if;
+  perform public.sembrar_catalogos_empresa(p_empresa);
+end $$;
+revoke all on function public.restaurar_catalogos(uuid) from public, anon;
+grant execute on function public.restaurar_catalogos(uuid) to authenticated;
 
 commit;
 select 'Parte 4 de 4 instalada' as resultado;

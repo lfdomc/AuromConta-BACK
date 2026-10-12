@@ -117,7 +117,7 @@ def _tabla(filas, anchos, total=False):
 
 
 def boleta_pdf(empresa: dict, planilla: dict, empleado: dict, boleta: dict, lineas: list[dict], nota: str | None = None,
-               logo: bytes | None = None) -> bytes:
+               logo: bytes | None = None, saldo_vacaciones: bool = False, detalle_subsidio: bool = False) -> bytes:
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=LETTER, leftMargin=18 * mm, rightMargin=18 * mm, topMargin=16 * mm,
                             bottomMargin=16 * mm, title="Boleta de pago")
@@ -155,6 +155,14 @@ def boleta_pdf(empresa: dict, planilla: dict, empleado: dict, boleta: dict, line
         el.append(Paragraph(f"Créditos fiscales aplicados al impuesto: {colones(boleta['creditos_renta'])}", SUB))
     if Decimal(boleta.get("subsidio_ins") or 0):
         el.append(Paragraph(f"Subsidio INS pagado directamente por el INS: {colones(boleta['subsidio_ins'])}", SUB))
+    if detalle_subsidio and int(boleta.get("dias_incapacidad") or 0):
+        # Configuración › Planilla › «Detalle del subsidio en la boleta» (Odoo: subsidio patronal).
+        el.append(Paragraph(
+            f"Incapacidad: {boleta['dias_incapacidad']} día(s). Subsidio a cargo del patrono (días 1 a 3): "
+            f"{colones(boleta.get('costo_patrono_incapacidad') or 0)}. Subsidio CCSS (lo paga la Caja): "
+            f"{colones(boleta.get('subsidio_ccss') or 0)}.", SUB))
+    if saldo_vacaciones and empleado.get("saldo_vacaciones") is not None:
+        el.append(Paragraph(f"Saldo de vacaciones a la fecha: {Decimal(str(empleado['saldo_vacaciones'])):.2f} días", SUB))
     if empleado.get("iban"):
         el.append(Paragraph(f"Depósito a la cuenta {empleado['iban']}", SUB))
     if nota:

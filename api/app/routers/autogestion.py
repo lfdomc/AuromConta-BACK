@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import calendar
 import hmac
+import html
 import json
 import logging
 import time
@@ -871,7 +872,15 @@ def aplicar_cambios_salariales(conn, hoy: date) -> list[dict]:
     return aplicados
 
 
-def acumular_vacaciones(conn, hoy: date) -> list[dict]:
+def dias_incapacidad_vacaciones(conn, empleado_id, desde: date, hasta: date) -> int:
+    """Días de incapacidad que cuentan para vacaciones (sin maternidad, Art. 95 CT) en (desde, hasta]."""
+    return int(conn.execute("""select coalesce(sum(least(hasta, %(h)s) - greatest(desde, %(d)s + 1) + 1), 0) as dias
+                                 from incapacidades where empleado_id = %(e)s and estado = 'confirmada' and tipo <> 'maternity'
+                                  and desde <= %(h)s and hasta > %(d)s""",
+                              {"e": empleado_id, "d": desde, "h": hasta}).fetchone()["dias"])
+
+
+def acumular_vacaciones(conn, hoy: date, empleado_id=None) -> list[dict]:
     """Art. 153 CT: 12 días hábiles de vacaciones por cada 50 semanas. Igual que el módulo Odoo
     (calc_vacation_accrual, método mensual): 1 día por cada mes cumplido desde la fecha de ingreso.
     El saldo de la ficha es el punto de partida en la fecha en que el empleado se registró (o se
@@ -879,24 +888,132 @@ def acumular_vacaciones(conn, hoy: date) -> list[dict]:
     public.vacaciones_acumuladas guarda cada acreditación y hace la tarea idempotente."""
     filas = conn.execute("""
         select e.id, e.empresa_id, e.fecha_ingreso, e.saldo_vacaciones, (e.creado_en at time zone 'America/Costa_Rica')::date as creado,
-               (select max(fecha) from vacaciones_acumuladas va where va.empleado_id = e.id) as ultima
+               e.vacaciones_corte, (select max(fecha) from vacaciones_acumuladas va where va.empleado_id = e.id) as ultima
           from empleados e join empresas em on em.id = e.empresa_id and em.estado_servicio <> 'baja'
-         where e.estado = 'activo' and e.fecha_ingreso <= %s""", (hoy,)).fetchall()
+         where e.estado = 'activo' and e.fecha_ingreso <= %s and (%s::uuid is null or e.id = %s)""",
+                         (hoy, empleado_id, empleado_id)).fetchall()
     acreditados = []
+    configs: dict = {}
     for f in filas:
-        corte = max(d for d in (f["ultima"], f["creado"], f["fecha_ingreso"]) if d is not None)
+        # Con saldo inicial (pre-implementación) se acumula desde su fecha de corte, como en Odoo;
+        # si no, desde que el colaborador entró al sistema.
+        inicio = f["vacaciones_corte"] or f["creado"]
+        corte = max(d for d in (f["ultima"], inicio, f["fecha_ingreso"]) if d is not None)
         n = meses_cumplidos(f["fecha_ingreso"], corte, hoy)
         if n <= 0:
             continue
-        saldo = Decimal(f["saldo_vacaciones"]) + n
+        if f["empresa_id"] not in configs:
+            configs[f["empresa_id"]] = conn.execute(
+                """select vacaciones_excluir_incapacidad, vacaciones_dias_aniversario from configuracion_planilla
+                    where empresa_id = %s""", (f["empresa_id"],)).fetchone() or {}
+        cfg = configs[f["empresa_id"]]
+        dias = Decimal(n)
+        detalle = [f"{n} mes(es) cumplido(s) desde {corte:%d/%m/%Y} (Art. 153 CT)"]
+        if cfg.get("vacaciones_excluir_incapacidad"):
+            # Igual que el módulo Odoo: 1 día de vacación menos por cada 29 días de incapacidad acumulados
+            # desde la base (corte del saldo o ingreso), sin maternidad. Se descuenta lo que se completó en este tramo.
+            base = f["vacaciones_corte"] or f["fecha_ingreso"]
+            antes = dias_incapacidad_vacaciones(conn, f["id"], base, corte) if corte > base else 0
+            ahora = dias_incapacidad_vacaciones(conn, f["id"], base, hoy)
+            menos = Decimal(ahora // 29 - antes // 29)
+            if menos > 0:
+                dias -= menos
+                detalle.append(f"menos {menos} por incapacidad ({ahora} día(s) acumulados, 1 por cada 29)")
+        if cfg.get("vacaciones_dias_aniversario"):
+            # Beneficio por aniversario: el mes del aniversario suma hasta el total configurado
+            # (el mes normal ya aporta 1 día). Solo desde el primer año cumplido.
+            extra = Decimal(cfg["vacaciones_dias_aniversario"]) - 1
+            ing = f["fecha_ingreso"]
+            for anio in range(corte.year, hoy.year + 1):
+                try:
+                    aniv = ing.replace(year=anio)
+                except ValueError:                  # 29 de febrero
+                    aniv = date(anio, 2, 28)
+                if anio > ing.year and corte < aniv <= hoy and extra > 0:
+                    dias += extra
+                    detalle.append(f"más {extra} por aniversario {anio - ing.year}")
+        if dias <= 0:
+            continue
+        saldo = Decimal(f["saldo_vacaciones"]) + dias
         ins = conn.execute("""insert into vacaciones_acumuladas (empresa_id, empleado_id, fecha, dias, saldo_resultante, detalle)
                               values (%s,%s,%s,%s,%s,%s) on conflict (empleado_id, fecha) do nothing returning id""",
-                           (f["empresa_id"], f["id"], hoy, n, saldo,
-                            f"{n} mes(es) cumplido(s) desde {corte:%d/%m/%Y} (Art. 153 CT)")).fetchone()
+                           (f["empresa_id"], f["id"], hoy, dias, saldo, "; ".join(detalle))).fetchone()
         if ins:
-            conn.execute("update empleados set saldo_vacaciones = saldo_vacaciones + %s where id = %s", (n, f["id"]))
-            acreditados.append({"empleado_id": f["id"], "empresa_id": f["empresa_id"], "dias": n, "saldo": saldo})
+            conn.execute("update empleados set saldo_vacaciones = saldo_vacaciones + %s where id = %s", (dias, f["id"]))
+            acreditados.append({"empleado_id": f["id"], "empresa_id": f["empresa_id"], "dias": dias, "saldo": saldo})
     return acreditados
+
+
+def rebase_vacaciones(conn, empleado_id, hoy: date) -> None:
+    """Saldo inicial de vacaciones (pre-implementación, como en Odoo): el saldo vuelve a partir del
+    dato de la ficha a la fecha de corte, menos lo disfrutado después del corte, y se re-acredita
+    lo ganado desde entonces."""
+    f = conn.execute("select vacaciones_saldo_inicial, vacaciones_corte from empleados where id = %s",
+                     (empleado_id,)).fetchone()
+    if not f or f["vacaciones_saldo_inicial"] is None or not f["vacaciones_corte"]:
+        return
+    tomados = conn.execute("""select coalesce(sum(dias), 0) as d from vacaciones
+                               where empleado_id = %s and boleta_id is not null and desde > %s""",
+                           (empleado_id, f["vacaciones_corte"])).fetchone()["d"]
+    conn.execute("delete from vacaciones_acumuladas where empleado_id = %s and fecha > %s",
+                 (empleado_id, f["vacaciones_corte"]))
+    conn.execute("update empleados set saldo_vacaciones = %s where id = %s",
+                 (Decimal(f["vacaciones_saldo_inicial"]) - Decimal(tomados), empleado_id))
+    acumular_vacaciones(conn, hoy, empleado_id)
+
+
+def resumen_vacaciones(conn, empleado_id) -> dict:
+    """Panel «Saldo de vacaciones» de la ficha: de dónde sale el saldo actual."""
+    e = conn.execute("""select fecha_ingreso, saldo_vacaciones, vacaciones_saldo_inicial, vacaciones_corte,
+                               (creado_en at time zone 'America/Costa_Rica')::date as creado from empleados where id = %s""",
+                     (empleado_id,)).fetchone()
+    desde = e["vacaciones_corte"] or e["creado"]
+    acum = conn.execute("""select fecha, dias, saldo_resultante, detalle from vacaciones_acumuladas
+                            where empleado_id = %s and fecha > %s order by fecha""", (empleado_id, desde)).fetchall()
+    tomados = conn.execute("""select coalesce(sum(dias), 0) as d from vacaciones
+                               where empleado_id = %s and boleta_id is not null and desde > %s""",
+                           (empleado_id, desde)).fetchone()["d"]
+    return {"fecha_ingreso": e["fecha_ingreso"], "saldo_inicial": e["vacaciones_saldo_inicial"],
+            "corte": e["vacaciones_corte"], "desde": desde,
+            "acumulado": sum((Decimal(a["dias"]) for a in acum), Decimal(0)), "tomados": Decimal(tomados),
+            "saldo": e["saldo_vacaciones"], "acreditaciones": acum}
+
+
+def bonos_antiguedad(conn, hoy: date) -> list[dict]:
+    """Como cron_bono_antiguedad de Odoo: el día del aniversario laboral crea un bono puntual (ese mes)
+    según la tabla Configuración › Bono de antigüedad de la empresa. Es salarial: cotiza CCSS (Art. 162 CT)."""
+    import calendar as _cal
+    creados = []
+    filas = conn.execute("""
+        select e.id, e.empresa_id, e.nombre, e.apellidos, e.salario_mensual,
+               extract(year from age(%(h)s::date, e.fecha_ingreso))::int as anios
+          from empleados e join empresas em on em.id = e.empresa_id and em.estado_servicio in ('prueba','activo','gracia')
+         where e.estado = 'activo' and e.fecha_ingreso < %(h)s
+           and extract(month from e.fecha_ingreso) = extract(month from %(h)s::date)
+           and extract(day from e.fecha_ingreso) = extract(day from %(h)s::date)
+           and exists (select 1 from bono_antiguedad b where b.empresa_id = e.empresa_id and b.activo)""",
+                         {"h": hoy}).fetchall()
+    for f in filas:
+        t = conn.execute("""select * from bono_antiguedad where empresa_id = %s and activo and desde_anios <= %s
+                             and (hasta_anios is null or hasta_anios >= %s) order by desde_anios desc limit 1""",
+                         (f["empresa_id"], f["anios"], f["anios"])).fetchone()
+        if not t:
+            continue
+        monto = (Decimal(f["salario_mensual"]) * Decimal(t["porcentaje"]) / 100 if t["tipo"] == "porcentaje"
+                 else Decimal(t["monto"])).quantize(Decimal("0.01"))
+        if monto <= 0:
+            continue
+        nombre = f"Bono de antigüedad — {f['anios']} año(s)"
+        if conn.execute("select 1 from bonos where empleado_id = %s and nombre = %s and desde >= %s",
+                        (f["id"], nombre, date(hoy.year, 1, 1))).fetchone():
+            continue
+        fin = date(hoy.year, hoy.month, _cal.monthrange(hoy.year, hoy.month)[1])
+        conn.execute("""insert into bonos (empresa_id, empleado_id, nombre, monto, afecto_ccss, afecto_salario_base,
+                                           recurrente, desde, hasta)
+                        values (%s, %s, %s, %s, true, true, false, %s, %s)""",
+                     (f["empresa_id"], f["id"], nombre, monto, hoy, fin))
+        creados.append({**f, "monto": monto, "nombre_bono": nombre})
+    return creados
 
 
 def cerrar_prestamos(conn) -> list[dict]:
@@ -1070,6 +1187,63 @@ def _enviar_a_empresa(conn, empresa_id, textos: list[str], *, por_correo: bool, 
     return res
 
 
+def alertas_documentos(conn, hoy: date) -> int:
+    """Configuración › Planilla › «Alertas de documentos» (como el módulo Odoo): envía a los correos
+    configurados la lista de documentos de colaboradores vencidos o por vencer, con un Excel adjunto.
+    Semanal (cada 7 días) o mensual (una vez por mes). Devuelve cuántas empresas recibieron aviso."""
+    import io as _io
+
+    from openpyxl import Workbook
+    from openpyxl.styles import Font
+
+    enviados = 0
+    for c in conn.execute("""select c.empresa_id, c.alertas_documentos_correos, c.alertas_documentos_frecuencia,
+                                    c.alertas_documentos_dias, c.alertas_documentos_ultima, em.nombre
+                               from configuracion_planilla c join empresas em on em.id = c.empresa_id
+                              where coalesce(trim(c.alertas_documentos_correos), '') <> ''
+                                and em.estado_servicio in ('prueba','activo','gracia')""").fetchall():
+        u = c["alertas_documentos_ultima"]
+        if u and (((hoy - u).days < 7) if c["alertas_documentos_frecuencia"] == "semanal"
+                  else (u.year, u.month) == (hoy.year, hoy.month)):
+            continue
+        # Días de aviso: los del tipo de documento (Configuración › Tipos de documento) o los generales.
+        docs = conn.execute("""select d.tipo, d.numero, d.vence, e.nombre, e.apellidos, e.identificacion
+                                 from documentos_empleado d join empleados e on e.id = d.empleado_id and e.estado = 'activo'
+                                 left join tipos_documento t on t.empresa_id = d.empresa_id and lower(t.nombre) = lower(d.tipo)
+                                where d.empresa_id = %s and d.vence is not null
+                                  and d.vence <= %s::date + coalesce(t.dias_alerta, %s)
+                                order by d.vence, e.apellidos""",
+                            (c["empresa_id"], hoy, int(c["alertas_documentos_dias"]))).fetchall()
+        conn.execute("update configuracion_planilla set alertas_documentos_ultima = %s where empresa_id = %s",
+                     (hoy, c["empresa_id"]))
+        if not docs:
+            continue
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Documentos"
+        ws.append(["Colaborador", "Identificación", "Documento", "Número", "Vence", "Estado"])
+        for cel in ws[1]:
+            cel.font = Font(bold=True)
+        filas_html = []
+        for d in docs:
+            estado = "Vencido" if d["vence"] < hoy else f"Vence en {(d['vence'] - hoy).days} día(s)"
+            nombre = f"{d['nombre']} {d['apellidos'] or ''}".strip()
+            ws.append([nombre, d["identificacion"], d["tipo"], d["numero"] or "", d["vence"], estado])
+            filas_html.append(f"<tr><td>{html.escape(nombre)}</td><td>{html.escape(d['tipo'])}</td>"
+                              f"<td>{d['vence']:%d/%m/%Y}</td><td>{estado}</td></tr>")
+        buf = _io.BytesIO()
+        wb.save(buf)
+        destinos = [x.strip() for x in c["alertas_documentos_correos"].split(",") if x.strip()]
+        correo.enviar(destinos, f"Documentos por vencer · {c['nombre']}",
+                      f"<p>Documentos de colaboradores vencidos o que vencen en los próximos "
+                      f"{c['alertas_documentos_dias']} días:</p><table border='1' cellpadding='4' cellspacing='0'>"
+                      "<tr><th>Colaborador</th><th>Documento</th><th>Vence</th><th>Estado</th></tr>"
+                      + "".join(filas_html) + "</table>",
+                      [(f"documentos-por-vencer-{hoy}.xlsx", buf.getvalue())])
+        enviados += 1
+    return enviados
+
+
 def _ya_corrio(conn, hoy: date) -> bool:
     fila = conn.execute("select valor from negocio.configuracion where clave = 'cron_diario'").fetchone()
     return bool(fila and (fila["valor"] or {}).get("fecha") == hoy.isoformat())
@@ -1095,12 +1269,13 @@ def cron_diario(fecha: date | None = Query(None, description="Solo para pruebas 
         cambios = tarea("cambios_salariales", aplicar_cambios_salariales, conn, hoy) or []
         acum = tarea("vacaciones", acumular_vacaciones, conn, hoy) or []
         prestamos = tarea("prestamos", cerrar_prestamos, conn) or []
+        antiguedad = tarea("bono_antiguedad", bonos_antiguedad, conn, hoy) or []
         prospectos = tarea("prospectos", actualizar_prospectos, conn, hoy) or {}
         resultado.update({
             "cambios_salariales": [{"empleado_id": c["empleado_id"], "salario_anterior": c["anterior"],
                                     "salario_nuevo": c["salario_nuevo"]} for c in cambios],
             "vacaciones": {"empleados": len(acum), "dias": sum(a["dias"] for a in acum)},
-            "prestamos_cerrados": len(prestamos), "prospectos": prospectos,
+            "prestamos_cerrados": len(prestamos), "prospectos": prospectos, "bonos_antiguedad": len(antiguedad),
         })
 
         enviados = {"empresas": 0, "correos": 0, "telegram": 0, "boletas_telegram": 0}
@@ -1110,6 +1285,9 @@ def cron_diario(fecha: date | None = Query(None, description="Solo para pruebas 
                 avisos.setdefault(c["empresa_id"], []).append(
                     f"💼 Se aplicó el nuevo salario de {_nombre(c)}: ₡{Decimal(c['salario_nuevo']):,.2f} "
                     f"(desde {c['fecha_efectiva']:%d/%m/%Y}).")
+            for b in antiguedad:
+                avisos.setdefault(b["empresa_id"], []).append(
+                    f"🎉 {_nombre(b)} cumple {b['anios']} año(s): se agregó su bono de antigüedad de ₡{b['monto']:,.2f}.")
             for p in prestamos:
                 avisos.setdefault(p["empresa_id"], []).append(f"✅ El préstamo «{p['descripcion']}» de {_nombre(p)} quedó pagado.")
             for eid, textos in avisos.items():
@@ -1123,6 +1301,7 @@ def cron_diario(fecha: date | None = Query(None, description="Solo para pruebas 
                 if res:
                     enviados["telegram"] += res["telegram"]
             enviados["boletas_telegram"] = tarea("boletas_telegram", avisar_boletas_listas, conn) or 0
+            enviados["alertas_documentos"] = tarea("alertas_documentos", alertas_documentos, conn, hoy) or 0
         resultado["avisos"] = enviados
         resultado["avisos_omitidos"] = avisos_repetidos
 
