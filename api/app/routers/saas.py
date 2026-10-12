@@ -313,12 +313,46 @@ class EmpresaPlataformaUpd(_Base):
 @r.patch("/empresas/{id}", summary="Cambiar estado del servicio o plan")
 def editar_empresa(id: UUID, datos: EmpresaPlataformaUpd, conn: Conexion = Depends(admin_plataforma)) -> dict:
     cambios = datos.model_dump(exclude_unset=True, exclude_none=True)
-    fila = crud.actualizar(conn, "empresas", id, cambios)
-    if not fila:
+    antes = conn.execute("select * from empresas where id = %s", (id,)).fetchone()
+    if not antes:
         raise HTTPException(404, "Empresa no encontrada")
-    if "estado_servicio" in cambios:
-        conn.execute("update negocio.clientes set estado = %s where empresa_id = %s", (cambios["estado_servicio"], id))
-    return empresa(id, conn)
+    nuevo = cambios.get("estado_servicio")
+    aviso = _cliente_para_cobro(conn, antes, nuevo) if nuevo and nuevo != antes["estado_servicio"] else None
+    crud.actualizar(conn, "empresas", id, cambios)
+    return {**empresa(id, conn), "aviso_cobro": aviso}
+
+
+# Estados en los que la empresa paga (igual que negocio.ESTADOS_COBRABLES).
+_COBRABLES = ("activo", "gracia", "solo_lectura", "suspendido")
+
+
+def _cliente_para_cobro(conn: Conexion, emp: dict, nuevo: str) -> str | None:
+    """Mantiene la ficha de cobro (negocio.clientes) al cambiar el estado del servicio.
+    - Si la empresa pasa a un estado que se cobra y no tiene ficha, la crea con los datos de la empresa.
+    - Al salir de «prueba», el cobro empieza este mes: los meses de prueba no quedan como pendientes.
+    Devuelve un aviso si no se pudo crear la ficha (el cambio de estado se aplica igual)."""
+    cli = conn.execute("select * from negocio.clientes where empresa_id = %s", (emp["id"],)).fetchone()
+    hoy = hoy_cr()
+    if cli is None:
+        if nuevo not in _COBRABLES:
+            return None
+        ced = "".join(ch for ch in (emp.get("cedula_juridica") or "") if ch.isdigit())
+        correo = (emp.get("correo") or "").strip()
+        if not ced or not correo:
+            falta = " y ".join(x for x, ok in (("la cédula jurídica", ced), ("el correo", correo)) if not ok)
+            return (f"El estado cambió, pero todavía no se le puede cobrar: falta {falta} de la empresa. "
+                    "Agréguelo en la configuración de la empresa o cree el cliente en Mi negocio › Clientes.")
+        tipo = "01" if len(ced) == 9 else "03" if len(ced) in (11, 12) else "02"
+        conn.execute("""insert into negocio.clientes (empresa_id, razon_social, tipo_identificacion, identificacion,
+                          correo_facturacion, telefono, estado, alta) values (%s, %s, %s, %s, %s, %s, %s, %s)""",
+                     (emp["id"], emp["nombre"], tipo, ced, correo, emp.get("telefono"), nuevo, hoy))
+        return None
+    cambios: dict = {"estado": nuevo}
+    if cli["estado"] == "prueba" and nuevo in _COBRABLES and cli["alta"] < hoy.replace(day=1):
+        cambios["alta"] = hoy
+    sets = sql.SQL(", ").join(sql.SQL("{} = %s").format(sql.Identifier(k)) for k in cambios)
+    conn.execute(sql.SQL("update negocio.clientes set {} where id = %s").format(sets), [*cambios.values(), cli["id"]])
+    return None
 
 
 # -------------------------------------------------------------------- Socios --

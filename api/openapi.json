@@ -13487,6 +13487,55 @@
     }
    }
   },
+  "/negocio/gastos/proveedores": {
+   "get": {
+    "tags": [
+     "negocio"
+    ],
+    "summary": "Proveedores ya usados en gastos (para autocompletar)",
+    "description": "Un proveedor por identificación (o por nombre si no tiene), con los datos de su gasto más reciente.",
+    "operationId": "proveedores_gastos_negocio_gastos_proveedores_get",
+    "parameters": [
+     {
+      "name": "authorization",
+      "in": "header",
+      "required": false,
+      "schema": {
+       "type": "string",
+       "default": "",
+       "title": "Authorization"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "Successful Response",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "array",
+         "items": {
+          "type": "object",
+          "additionalProperties": true
+         },
+         "title": "Response Proveedores Gastos Negocio Gastos Proveedores Get"
+        }
+       }
+      }
+     },
+     "422": {
+      "description": "Validation Error",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
   "/negocio/gastos/{id}": {
    "patch": {
     "tags": [

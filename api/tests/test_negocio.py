@@ -534,7 +534,8 @@ def test_suscripcion_solo_de_mi_empresa_y_registro_de_tarjeta(client, dsn, duena
     eid, adm = nueva_empresa(client, dsn, empleados=55, cedula="3-101-777777")
     otra, adm2 = nueva_empresa(client, dsn)
     s = client.get(f"/empresas/{eid}/suscripcion", headers=adm["h"])
-    assert s.status_code == 200 and s.json()["cliente"] is None
+    # Con cédula, la ficha de cobro existe desde el registro (en prueba, sin cobrar).
+    assert s.status_code == 200 and s.json()["cliente"]["identificacion"] == "3101777777"
     assert s.json()["precio"]["subtotal"] == "66000.00" and s.json()["estado"] == "prueba"
     assert client.get(f"/empresas/{otra}/suscripcion", headers=adm["h"]).status_code == 404
     assert client.get(f"/empresas/{eid}/suscripcion", headers=adm2["h"]).status_code == 404
@@ -633,3 +634,16 @@ def test_configuracion(client, duena, mock):
     assert r.status_code == 200 and r.json()["valor"] == "5"
     r = client.put("/negocio/configuracion/emisor", json={"valor": {"telefono": "2446-0000"}}, headers=duena).json()
     assert r["valor"]["telefono"] == "2446-0000" and r["valor"]["codigo_actividad"] == "722003"   # se fusiona
+
+
+def test_proveedores_de_gastos(client, duena):
+    base = {"fecha": "2026-08-01", "subtotal": "1000", "iva": "0"}
+    for d in ({"proveedor": "Ferretería Lagos", "identificacion_proveedor": "3101999888", "fecha": "2026-07-01"},
+              {"proveedor": "Ferreteria Lagos S.A.", "identificacion_proveedor": "3101999888"},
+              {"proveedor": "Pulpería La Esquina"}):
+        r = client.post("/negocio/gastos", json={**base, **d}, headers=duena)
+        assert r.status_code == 201, r.text
+    p = client.get("/negocio/gastos/proveedores", headers=duena).json()
+    lagos = [x for x in p if x["identificacion_proveedor"] == "3101999888"]
+    assert len(lagos) == 1 and lagos[0]["proveedor"] == "Ferreteria Lagos S.A."   # el nombre más reciente
+    assert any(x["proveedor"] == "Pulpería La Esquina" for x in p)

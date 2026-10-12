@@ -197,3 +197,35 @@ def test_portal_vacaciones(client, m):
     # la empresa ve la solicitud pendiente de aprobar
     lista = client.get(f"/empresas/{m['e']}/vacaciones", params={"estado": "solicitada"}, headers=m["h"]["jefa"]).json()
     assert any(x["id"] == r.json()["id"] for x in lista)
+
+
+def test_pasar_de_prueba_a_cobro(client, usuarios, dsn):
+    """La dueña activa una empresa en prueba: se crea su ficha de cobro y el cobro empieza este mes.
+    Cambiar el estado desde «Mi negocio › Clientes» actualiza también la empresa."""
+    from app.fechas import hoy_cr
+    j = usuarios["admin"]["h"]
+    d = usuarios["duena"]["h"]
+    e = client.post("/empresas", json={"nombre": "Prueba Cobro SA"}, headers=j)
+    assert e.status_code == 201, e.text
+    eid = e.json()["id"]
+    assert client.get(f"/plataforma/empresas/{eid}", headers=d).json()["estado_servicio"] == "prueba"
+    # Sin cédula ni correo no se puede cobrar: mensaje claro
+    r = client.patch(f"/plataforma/empresas/{eid}", json={"estado_servicio": "activo"}, headers=d)
+    assert r.status_code == 200 and r.json()["cliente"] is None and "cédula" in r.json()["aviso_cobro"]
+    client.patch(f"/plataforma/empresas/{eid}", json={"estado_servicio": "prueba"}, headers=d)
+    client.patch(f"/empresas/{eid}", json={"cedula_juridica": "3-101-777888", "correo": "pagos@cobro.cr"}, headers=j)
+    r = client.patch(f"/plataforma/empresas/{eid}", json={"estado_servicio": "activo"}, headers=d)
+    assert r.status_code == 200, r.text
+    cli = r.json()["cliente"]
+    assert cli and cli["estado"] == "activo" and cli["identificacion"] == "3101777888"
+    assert cli["correo_facturacion"] == "pagos@cobro.cr" and cli["alta"] == str(hoy_cr())
+    # Desde Clientes: pasa a gracia y la empresa lo refleja
+    r = client.patch(f"/negocio/clientes/{cli['id']}", json={"estado": "gracia"}, headers=d)
+    assert r.status_code == 200, r.text
+    assert client.get(f"/plataforma/empresas/{eid}", headers=d).json()["estado_servicio"] == "gracia"
+    # Una ficha creada en prueba hace meses empieza a cobrar desde hoy al activarse
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.execute("update negocio.clientes set estado = 'prueba', alta = '2026-01-15' where id = %s", (cli["id"],))
+        c.execute("update empresas set estado_servicio = 'prueba' where id = %s", (eid,))
+    r = client.patch(f"/plataforma/empresas/{eid}", json={"estado_servicio": "activo"}, headers=d)
+    assert r.json()["cliente"]["alta"] == str(hoy_cr())

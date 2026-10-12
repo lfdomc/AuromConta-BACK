@@ -639,6 +639,13 @@ def listar_clientes(conn=Depends(admin_plataforma), estado: str | None = None, b
 def crear_cliente(datos: ClienteIn, conn=Depends(admin_plataforma)) -> dict:
     d = _json_precios(datos.model_dump(exclude_none=True))
     d["identificacion"] = facturacion._digitos(d["identificacion"])
+    # Las empresas registradas ya tienen ficha automática (migración 0016): se completa con estos datos.
+    existente = conn.execute("select id from negocio.clientes where empresa_id = %s", (d["empresa_id"],)).fetchone() \
+        if d.get("empresa_id") else None
+    if existente:
+        c = crud.actualizar(conn, "negocio.clientes", existente["id"], {k: v for k, v in d.items() if k != "empresa_id"})
+        _alinear_inicio_planilla(conn, c)
+        return _cliente_con_precio(conn, c)
     try:
         with conn.transaction():
             c = crud.insertar(conn, "negocio.clientes", d)
@@ -666,9 +673,19 @@ def editar_cliente(id: UUID, datos: ClienteUpd, conn=Depends(admin_plataforma)) 
         d["identificacion"] = facturacion._digitos(d["identificacion"])
     if d.get("estado") == "baja":
         d.setdefault("baja", hoy_cr())
+    antes = conn.execute("select estado, alta from negocio.clientes where id = %s", (id,)).fetchone()
+    if not antes:
+        raise HTTPException(404, "Cliente no encontrado")
+    # Al salir de «prueba» el cobro empieza este mes (si no se indicó otra fecha de alta).
+    if (antes["estado"] == "prueba" and d.get("estado") in ESTADOS_COBRABLES and "alta" not in d
+            and antes["alta"] < hoy_cr().replace(day=1)):
+        d["alta"] = hoy_cr()
     c = crud.actualizar(conn, "negocio.clientes", id, d)
     if not c:
         raise HTTPException(404, "Cliente no encontrado")
+    if "estado" in d and c.get("empresa_id"):
+        # Misma regla en las dos pantallas: el estado del cliente es el estado del servicio de su empresa.
+        conn.execute("update public.empresas set estado_servicio = %s where id = %s", (c["estado"], c["empresa_id"]))
     _alinear_inicio_planilla(conn, c)
     return _cliente_con_precio(conn, c)
 
@@ -880,6 +897,16 @@ def listar_gastos(conn=Depends(admin_plataforma), desde: date | None = None, has
                             where (%(d)s::date is null or g.fecha >= %(d)s) and (%(h)s::date is null or g.fecha <= %(h)s)
                               and (%(c)s::uuid is null or g.categoria_id = %(c)s)
                             order by g.fecha desc limit 2000""", {"d": desde, "h": hasta, "c": categoria_id}).fetchall()
+
+
+@r.get("/gastos/proveedores", summary="Proveedores ya usados en gastos (para autocompletar)")
+def proveedores_gastos(conn=Depends(admin_plataforma)) -> list[dict]:
+    """Un proveedor por identificación (o por nombre si no tiene), con los datos de su gasto más reciente."""
+    return conn.execute("""select distinct on (coalesce(nullif(identificacion_proveedor, ''), lower(proveedor)))
+                                  proveedor, identificacion_proveedor, categoria_id, fecha as ultimo
+                             from negocio.gastos
+                            order by coalesce(nullif(identificacion_proveedor, ''), lower(proveedor)), fecha desc, creado_en desc
+                            limit 1000""").fetchall()
 
 
 @r.post("/gastos", status_code=201)
