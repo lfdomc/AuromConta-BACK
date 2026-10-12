@@ -26,7 +26,7 @@ from ..auth import (
     conexion,
     usuario_actual,
 )
-from ..config import settings
+from ..config import cabeceras_admin_supabase, settings
 from ..db import Conexion
 from ..fechas import hoy_cr
 from ..servicios import facturacion, pdf
@@ -352,8 +352,7 @@ def _invitar_supabase(correo: str, datos: dict, destino: str) -> str | None:
     if not (settings.supabase_url and settings.supabase_service_key):
         return None
     resp = httpx.post(f"{settings.supabase_url}/auth/v1/invite",
-                      headers={"apikey": settings.supabase_service_key,
-                               "Authorization": f"Bearer {settings.supabase_service_key}"},
+                      headers=cabeceras_admin_supabase(),
                       json={"email": correo, "data": datos, "redirect_to": f"{settings.app_url}{destino}"}, timeout=20)
     if resp.status_code >= 300:
         raise HTTPException(502, f"No se pudo enviar la invitación: {resp.text[:200]}")

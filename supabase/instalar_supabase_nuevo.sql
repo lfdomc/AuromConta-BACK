@@ -1,0 +1,3330 @@
+-- =============================================================================
+-- Planilla Costa Rica · Instalación completa en un proyecto de Supabase NUEVO
+-- Contiene las 13 migraciones en orden (0001 a 0014). Pegar completo en
+-- SQL Editor → New query → Run. Corre dentro de una transacción: si algo falla,
+-- no queda nada a medias y se puede volver a ejecutar.
+-- NO usar en un proyecto que ya tenga las migraciones aplicadas.
+-- =============================================================================
+begin;
+
+-- >>>>>>>>>>>>>>>>>>>>>>>> 20261009000100_nucleo.sql
+-- =============================================================================
+-- Planilla Costa Rica · 0001 Núcleo, seguridad multiempresa y auditoría
+-- Una sola base para todos los clientes. Cada fila lleva empresa_id y RLS
+-- garantiza que cada usuario solo vea las empresas donde tiene acceso:
+--   * usuarios de la empresa (admin / aprobador / operador / lectura)
+--   * contadores o vendedores asignados (supervisión y soporte)
+--   * la dueña de la plataforma (A.U.R.O.M.)
+-- =============================================================================
+
+create extension if not exists pgcrypto;
+
+-- -----------------------------------------------------------------------------
+-- Utilidades
+-- -----------------------------------------------------------------------------
+create or replace function public.tg_actualizado() returns trigger
+language plpgsql as $$
+begin
+  new.actualizado_en := now();
+  new.actualizado_por := auth.uid();
+  return new;
+end $$;
+
+-- -----------------------------------------------------------------------------
+-- Plataforma y socios (se crean antes porque las funciones de acceso los usan)
+-- -----------------------------------------------------------------------------
+create table public.plataforma_admins (
+  usuario_id uuid primary key references auth.users(id) on delete cascade,
+  creado_en timestamptz not null default now()
+);
+
+create table public.empresas (
+  id uuid primary key default gen_random_uuid(),
+  nombre text not null,
+  cedula_juridica text,
+  numero_patronal text,
+  poliza_ins text,
+  clase_riesgo_ins text not null default 'II' check (clase_riesgo_ins in ('I','II','III','IV','V')),
+  correo text,
+  telefono text,
+  direccion text,
+  logo_url text,
+  moneda text not null default 'CRC',
+  -- SaaS
+  plan text not null default 'estandar',
+  estado_servicio text not null default 'activo'
+    check (estado_servicio in ('prueba','activo','gracia','solo_lectura','suspendido','baja')),
+  referido_por uuid,                -- socio que la trajo (atribución)
+  creado_en timestamptz not null default now(),
+  creado_por uuid default auth.uid(),
+  actualizado_en timestamptz not null default now(),
+  actualizado_por uuid
+);
+create trigger empresas_upd before update on public.empresas
+  for each row execute function public.tg_actualizado();
+
+create table public.usuarios_empresa (
+  id uuid primary key default gen_random_uuid(),
+  empresa_id uuid not null references public.empresas(id) on delete cascade,
+  usuario_id uuid not null references auth.users(id) on delete cascade,
+  rol text not null check (rol in ('admin','aprobador','operador','lectura')),
+  activo boolean not null default true,
+  creado_en timestamptz not null default now(),
+  creado_por uuid default auth.uid(),
+  unique (empresa_id, usuario_id)
+);
+create index on public.usuarios_empresa (usuario_id) where activo;
+
+-- Socios: contadores (soporte primario + 20 % recurrente) y vendedores
+-- (3 primeras mensualidades). Ambos pueden quedar asignados a empresas.
+create table public.socios (
+  id uuid primary key default gen_random_uuid(),
+  usuario_id uuid unique references auth.users(id) on delete set null,
+  tipo text not null check (tipo in ('contador','vendedor')),
+  nombre text not null,
+  cedula text,
+  correo text not null,
+  telefono text,
+  telegram_chat_id text,
+  codigo_referido text not null unique default upper(substr(md5(gen_random_uuid()::text), 1, 8)),
+  certificado boolean not null default false,
+  iban text,
+  estado text not null default 'activo' check (estado in ('pendiente','activo','suspendido','baja')),
+  creado_en timestamptz not null default now(),
+  actualizado_en timestamptz not null default now(),
+  actualizado_por uuid
+);
+create trigger socios_upd before update on public.socios
+  for each row execute function public.tg_actualizado();
+alter table public.empresas
+  add constraint empresas_referido_fk foreign key (referido_por) references public.socios(id);
+
+-- Contadores / vendedores asignados a cada empresa para supervisión y soporte.
+create table public.asignaciones_contador (
+  id uuid primary key default gen_random_uuid(),
+  empresa_id uuid not null references public.empresas(id) on delete cascade,
+  socio_id uuid not null references public.socios(id) on delete cascade,
+  funciones text[] not null default array['supervision','soporte']::text[],
+  permiso text not null default 'lectura' check (permiso in ('lectura','operacion')),
+  soporte_principal boolean not null default true,
+  asignado_por uuid default auth.uid(),
+  desde timestamptz not null default now(),
+  revocado_en timestamptz,
+  revocado_por uuid,
+  check (funciones <@ array['supervision','soporte','ventas','implementacion']::text[])
+);
+create unique index asignacion_activa_unica on public.asignaciones_contador (empresa_id, socio_id)
+  where revocado_en is null;
+create index on public.asignaciones_contador (socio_id) where revocado_en is null;
+
+-- -----------------------------------------------------------------------------
+-- Funciones de acceso (security definer: leen tablas protegidas sin recursión)
+-- -----------------------------------------------------------------------------
+create or replace function public.es_admin_plataforma() returns boolean
+language sql stable security definer set search_path = public as $$
+  select exists (select 1 from plataforma_admins where usuario_id = auth.uid())
+$$;
+
+create or replace function public.mi_socio_id() returns uuid
+language sql stable security definer set search_path = public as $$
+  select id from socios where usuario_id = auth.uid() and estado = 'activo'
+$$;
+
+-- Rol efectivo del usuario actual en una empresa.
+--   admin | aprobador | operador | lectura           (usuarios de la empresa)
+--   contador_operacion | contador_lectura           (socio asignado)
+--   plataforma                                       (dueña de A.U.R.O.M.)
+create or replace function public.rol_en_empresa(p_empresa uuid) returns text
+language sql stable security definer set search_path = public as $$
+  select coalesce(
+    (select rol from usuarios_empresa
+      where empresa_id = p_empresa and usuario_id = auth.uid() and activo),
+    (select case when bool_or(a.permiso = 'operacion') then 'contador_operacion'
+                 else 'contador_lectura' end
+       from asignaciones_contador a join socios s on s.id = a.socio_id
+      where a.empresa_id = p_empresa and a.revocado_en is null
+        and s.usuario_id = auth.uid() and s.estado = 'activo'
+      having count(*) > 0),
+    (select 'plataforma' where exists (select 1 from plataforma_admins where usuario_id = auth.uid()))
+  )
+$$;
+
+create or replace function public.puede_ver(p_empresa uuid) returns boolean
+language sql stable as $$ select public.rol_en_empresa(p_empresa) is not null $$;
+
+create or replace function public.puede_operar(p_empresa uuid) returns boolean
+language sql stable as $$
+  select public.rol_en_empresa(p_empresa) in ('admin','aprobador','operador','contador_operacion','plataforma')
+$$;
+
+create or replace function public.puede_aprobar(p_empresa uuid) returns boolean
+language sql stable as $$
+  select public.rol_en_empresa(p_empresa) in ('admin','aprobador','plataforma')
+$$;
+
+create or replace function public.es_admin_empresa(p_empresa uuid) returns boolean
+language sql stable as $$
+  select public.rol_en_empresa(p_empresa) in ('admin','plataforma')
+$$;
+
+-- Empresa en solo lectura o suspendida: nadie (salvo plataforma) escribe.
+create or replace function public.empresa_escribible(p_empresa uuid) returns boolean
+language sql stable security definer set search_path = public as $$
+  select public.es_admin_plataforma()
+      or exists (select 1 from empresas where id = p_empresa
+                 and estado_servicio in ('prueba','activo','gracia'))
+$$;
+
+-- Crea las 4 políticas estándar de una tabla con empresa_id.
+create or replace function public._politicas_empresa(p_tabla regclass) returns void
+language plpgsql as $$
+begin
+  execute format('alter table %s enable row level security', p_tabla);
+  execute format('create policy ver on %s for select to authenticated using (public.puede_ver(empresa_id))', p_tabla);
+  execute format('create policy crear on %s for insert to authenticated with check (public.puede_operar(empresa_id) and public.empresa_escribible(empresa_id))', p_tabla);
+  execute format('create policy editar on %s for update to authenticated using (public.puede_operar(empresa_id)) with check (public.puede_operar(empresa_id) and public.empresa_escribible(empresa_id))', p_tabla);
+  execute format('create policy borrar on %s for delete to authenticated using (public.puede_operar(empresa_id) and public.empresa_escribible(empresa_id))', p_tabla);
+  execute format('grant select, insert, update, delete on %s to authenticated', p_tabla);
+end $$;
+
+-- -----------------------------------------------------------------------------
+-- Auditoría
+-- -----------------------------------------------------------------------------
+create table public.auditoria (
+  id bigint generated always as identity primary key,
+  empresa_id uuid,
+  tabla text not null,
+  registro_id text,
+  accion text not null,
+  antes jsonb,
+  despues jsonb,
+  usuario_id uuid,
+  fecha timestamptz not null default now()
+);
+create index on public.auditoria (empresa_id, fecha desc);
+
+create or replace function public.tg_auditar() returns trigger
+language plpgsql security definer set search_path = public as $$
+declare
+  v_row jsonb := to_jsonb(coalesce(new, old));
+begin
+  insert into auditoria (empresa_id, tabla, registro_id, accion, antes, despues, usuario_id)
+  values (nullif(v_row ->> 'empresa_id', '')::uuid, tg_table_name, v_row ->> 'id', tg_op,
+          case when tg_op <> 'INSERT' then to_jsonb(old) end,
+          case when tg_op <> 'DELETE' then to_jsonb(new) end,
+          auth.uid());
+  return coalesce(new, old);
+end $$;
+
+-- -----------------------------------------------------------------------------
+-- Configuración y catálogos
+-- -----------------------------------------------------------------------------
+create table public.configuracion_planilla (
+  empresa_id uuid primary key references public.empresas(id) on delete cascade,
+  metodo_renta text not null default 'per_period' check (metodo_renta in ('per_period','monthly_consolidated')),
+  base_renta text not null default 'gross' check (base_renta in ('gross','net_ccss')),
+  aplicar_bmc boolean not null default true,
+  bmc_monto numeric(14,2),
+  cesantia_modo text not null default 'legal' check (cesantia_modo in ('legal','custom')),
+  cesantia_tasa numeric(6,3) not null default 4.8,
+  factor_he_diurna numeric(4,2) not null default 1.5,
+  factor_he_doble numeric(4,2) not null default 2.0,
+  correo_remitente text,
+  nota_boleta text,
+  actualizado_en timestamptz not null default now(),
+  actualizado_por uuid
+);
+create trigger configuracion_upd before update on public.configuracion_planilla
+  for each row execute function public.tg_actualizado();
+
+create table public.sucursales (
+  id uuid primary key default gen_random_uuid(),
+  empresa_id uuid not null references public.empresas(id) on delete cascade,
+  codigo text,
+  nombre text not null,
+  direccion text,
+  telefono text,
+  correo text,
+  es_temporal boolean not null default false,
+  fecha_fin_proyecto date,
+  activa boolean not null default true,
+  creado_en timestamptz not null default now()
+);
+
+create table public.calendarios_pago (
+  id uuid primary key default gen_random_uuid(),
+  empresa_id uuid not null references public.empresas(id) on delete cascade,
+  nombre text not null,
+  frecuencia text not null check (frecuencia in ('monthly','biweekly','weekly','bimonthly')),
+  activo boolean not null default true,
+  creado_en timestamptz not null default now()
+);
+
+create table public.tipos_horario (
+  id uuid primary key default gen_random_uuid(),
+  empresa_id uuid not null references public.empresas(id) on delete cascade,
+  nombre text not null,
+  horas_diarias numeric(5,2) not null default 8,
+  dias_semana int not null default 6,
+  jornada text not null default 'diurna' check (jornada in ('diurna','mixta','nocturna')),
+  medio_tiempo boolean not null default false
+);
+
+-- Feriados: empresa_id nulo = feriado nacional (visible para todos).
+create table public.feriados (
+  id uuid primary key default gen_random_uuid(),
+  empresa_id uuid references public.empresas(id) on delete cascade,
+  fecha date not null,
+  nombre text not null,
+  pago_obligatorio boolean not null default true
+);
+create unique index feriados_unicos on public.feriados (coalesce(empresa_id, '00000000-0000-0000-0000-000000000000'::uuid), fecha);
+
+-- Parámetros legales con vigencia (globales). El motor los recibe como JSON.
+create table public.parametros_legales (
+  id uuid primary key default gen_random_uuid(),
+  vigente_desde date not null unique,
+  datos jsonb not null,
+  fuente text,
+  aprobado_por uuid,
+  creado_en timestamptz not null default now()
+);
+
+-- -----------------------------------------------------------------------------
+-- RLS del núcleo
+-- -----------------------------------------------------------------------------
+alter table public.plataforma_admins enable row level security;
+create policy ver on public.plataforma_admins for select to authenticated using (usuario_id = auth.uid());
+grant select on public.plataforma_admins to authenticated;
+
+alter table public.empresas enable row level security;
+create policy ver on public.empresas for select to authenticated using (public.puede_ver(id));
+create policy editar on public.empresas for update to authenticated
+  using (public.es_admin_empresa(id)) with check (public.es_admin_empresa(id));
+-- Alta de empresas: solo por la función crear_empresa() (Fase 6) o la plataforma.
+create policy crear on public.empresas for insert to authenticated with check (public.es_admin_plataforma());
+grant select, insert, update on public.empresas to authenticated;
+
+alter table public.usuarios_empresa enable row level security;
+create policy ver on public.usuarios_empresa for select to authenticated
+  using (usuario_id = auth.uid() or public.es_admin_empresa(empresa_id));
+create policy gestionar on public.usuarios_empresa for all to authenticated
+  using (public.es_admin_empresa(empresa_id)) with check (public.es_admin_empresa(empresa_id));
+grant select, insert, update, delete on public.usuarios_empresa to authenticated;
+
+alter table public.socios enable row level security;
+create policy ver on public.socios for select to authenticated using (
+  usuario_id = auth.uid() or public.es_admin_plataforma()
+  or exists (select 1 from public.asignaciones_contador a
+             where a.socio_id = socios.id and a.revocado_en is null and public.puede_ver(a.empresa_id)));
+create policy editar_propio on public.socios for update to authenticated
+  using (usuario_id = auth.uid() or public.es_admin_plataforma())
+  with check (usuario_id = auth.uid() or public.es_admin_plataforma());
+create policy gestionar on public.socios for insert to authenticated with check (public.es_admin_plataforma());
+create policy borrar on public.socios for delete to authenticated using (public.es_admin_plataforma());
+grant select, insert, update, delete on public.socios to authenticated;
+-- Un socio no puede cambiarse a sí mismo el tipo, estado ni la certificación.
+create or replace function public.tg_socio_campos_protegidos() returns trigger
+language plpgsql as $$
+begin
+  if not public.es_admin_plataforma() and current_user = 'authenticated'
+     and (new.tipo, new.estado, new.certificado, new.codigo_referido, new.usuario_id)
+         is distinct from (old.tipo, old.estado, old.certificado, old.codigo_referido, old.usuario_id) then
+    raise exception 'Solo la plataforma puede cambiar tipo, estado o certificación del socio';
+  end if;
+  return new;
+end $$;
+create trigger socios_protegidos before update on public.socios
+  for each row execute function public.tg_socio_campos_protegidos();
+
+alter table public.asignaciones_contador enable row level security;
+create policy ver on public.asignaciones_contador for select to authenticated
+  using (public.puede_ver(empresa_id) or socio_id = public.mi_socio_id());
+create policy gestionar on public.asignaciones_contador for all to authenticated
+  using (public.es_admin_empresa(empresa_id)) with check (public.es_admin_empresa(empresa_id));
+grant select, insert, update, delete on public.asignaciones_contador to authenticated;
+
+alter table public.auditoria enable row level security;
+create policy ver on public.auditoria for select to authenticated
+  using (public.es_admin_empresa(empresa_id) or (empresa_id is null and public.es_admin_plataforma()));
+grant select on public.auditoria to authenticated;
+
+select public._politicas_empresa('public.sucursales');
+select public._politicas_empresa('public.calendarios_pago');
+select public._politicas_empresa('public.tipos_horario');
+
+alter table public.configuracion_planilla enable row level security;
+create policy ver on public.configuracion_planilla for select to authenticated using (public.puede_ver(empresa_id));
+create policy gestionar on public.configuracion_planilla for all to authenticated
+  using (public.es_admin_empresa(empresa_id)) with check (public.es_admin_empresa(empresa_id));
+grant select, insert, update on public.configuracion_planilla to authenticated;
+
+alter table public.feriados enable row level security;
+create policy ver on public.feriados for select to authenticated using (empresa_id is null or public.puede_ver(empresa_id));
+create policy gestionar on public.feriados for all to authenticated
+  using ((empresa_id is null and public.es_admin_plataforma()) or (empresa_id is not null and public.es_admin_empresa(empresa_id)))
+  with check ((empresa_id is null and public.es_admin_plataforma()) or (empresa_id is not null and public.es_admin_empresa(empresa_id)));
+grant select, insert, update, delete on public.feriados to authenticated;
+
+alter table public.parametros_legales enable row level security;
+create policy ver on public.parametros_legales for select to authenticated using (true);
+create policy gestionar on public.parametros_legales for all to authenticated
+  using (public.es_admin_plataforma()) with check (public.es_admin_plataforma());
+grant select, insert, update, delete on public.parametros_legales to authenticated;
+
+create trigger auditar after insert or update or delete on public.usuarios_empresa
+  for each row execute function public.tg_auditar();
+create trigger auditar after insert or update or delete on public.asignaciones_contador
+  for each row execute function public.tg_auditar();
+create trigger auditar after insert or update or delete on public.configuracion_planilla
+  for each row execute function public.tg_auditar();
+create trigger auditar after insert or update or delete on public.parametros_legales
+  for each row execute function public.tg_auditar();
+
+
+-- >>>>>>>>>>>>>>>>>>>>>>>> 20261009000200_empleados_novedades.sql
+-- =============================================================================
+-- Planilla Costa Rica · 0002 Empleados, novedades y obligaciones (Fases 1 y 2)
+-- =============================================================================
+
+create table public.empleados (
+  id uuid primary key default gen_random_uuid(),
+  empresa_id uuid not null references public.empresas(id) on delete cascade,
+  usuario_id uuid references auth.users(id) on delete set null, -- portal del empleado
+  tipo_identificacion text not null default 'cedula'
+    check (tipo_identificacion in ('cedula','dimex','pasaporte','nite','otro')),
+  identificacion text not null,
+  nombre text not null,
+  apellidos text not null default '',
+  correo text,
+  telefono text,
+  fecha_nacimiento date,
+  fecha_ingreso date not null,
+  fecha_salida date,
+  estado text not null default 'activo' check (estado in ('activo','inactivo','liquidado')),
+  sucursal_id uuid references public.sucursales(id) on delete set null,
+  puesto text,
+  calendario_id uuid references public.calendarios_pago(id) on delete set null,
+  horario_id uuid references public.tipos_horario(id) on delete set null,
+  frecuencia text not null default 'biweekly' check (frecuencia in ('monthly','biweekly','weekly','bimonthly')),
+  salario_mensual numeric(14,2) not null default 0 check (salario_mensual >= 0),
+  por_asistencia boolean not null default false,
+  tarifa_hora numeric(14,2) not null default 0,
+  medio_tiempo boolean not null default false,
+  aplica_rop boolean not null default false,
+  hijos int not null default 0 check (hijos >= 0),
+  conyuge boolean not null default false,
+  num_empleadores int not null default 1 check (num_empleadores >= 1),
+  pensionado text not null default 'none' check (pensionado in ('none','estado','otro')),
+  exento boolean not null default false,
+  clase_riesgo_ins text check (clase_riesgo_ins in ('I','II','III','IV','V')),
+  banco text,
+  iban text,
+  saldo_vacaciones numeric(8,2) not null default 0,
+  creado_en timestamptz not null default now(),
+  creado_por uuid default auth.uid(),
+  actualizado_en timestamptz not null default now(),
+  actualizado_por uuid,
+  unique (empresa_id, identificacion)
+);
+create index on public.empleados (empresa_id, estado);
+create trigger empleados_upd before update on public.empleados
+  for each row execute function public.tg_actualizado();
+
+create table public.historial_salarial (
+  id uuid primary key default gen_random_uuid(),
+  empresa_id uuid not null references public.empresas(id) on delete cascade,
+  empleado_id uuid not null references public.empleados(id) on delete cascade,
+  fecha_efectiva date not null,
+  salario_anterior numeric(14,2) not null,
+  salario_nuevo numeric(14,2) not null check (salario_nuevo >= 0),
+  motivo text,
+  estado text not null default 'pendiente' check (estado in ('pendiente','autorizado','rechazado')),
+  solicitado_por uuid default auth.uid(),
+  autorizado_por uuid,
+  autorizado_en timestamptz,
+  creado_en timestamptz not null default now()
+);
+create index on public.historial_salarial (empleado_id, fecha_efectiva desc);
+
+-- Solo aprobador/admin puede autorizar o rechazar un cambio salarial.
+create or replace function public.tg_historial_autorizacion() returns trigger
+language plpgsql as $$
+begin
+  if new.estado is distinct from old.estado and new.estado <> 'pendiente' then
+    if current_user = 'authenticated' and not public.puede_aprobar(new.empresa_id) then
+      raise exception 'Solo un aprobador puede autorizar cambios salariales';
+    end if;
+    new.autorizado_por := auth.uid();
+    new.autorizado_en := now();
+  end if;
+  return new;
+end $$;
+create trigger historial_autorizacion before update on public.historial_salarial
+  for each row execute function public.tg_historial_autorizacion();
+
+create table public.documentos_empleado (
+  id uuid primary key default gen_random_uuid(),
+  empresa_id uuid not null references public.empresas(id) on delete cascade,
+  empleado_id uuid not null references public.empleados(id) on delete cascade,
+  tipo text not null,
+  numero text,
+  vence date,
+  archivo_path text,   -- ruta en Supabase Storage (bucket documentos/{empresa_id}/...)
+  creado_en timestamptz not null default now()
+);
+
+create table public.movimientos_empleado (
+  id uuid primary key default gen_random_uuid(),
+  empresa_id uuid not null references public.empresas(id) on delete cascade,
+  empleado_id uuid not null references public.empleados(id) on delete cascade,
+  tipo text not null check (tipo in ('ingreso','traslado','cambio_puesto','amonestacion','salida','otro')),
+  fecha date not null,
+  detalle text,
+  creado_en timestamptz not null default now(),
+  creado_por uuid default auth.uid()
+);
+
+-- ---------------------------------------------------------------- Novedades --
+create table public.marcas_asistencia (
+  id uuid primary key default gen_random_uuid(),
+  empresa_id uuid not null references public.empresas(id) on delete cascade,
+  empleado_id uuid not null references public.empleados(id) on delete cascade,
+  entrada timestamptz not null,
+  salida timestamptz,
+  origen text not null default 'manual' check (origen in ('reloj','manual','importado')),
+  check (salida is null or salida > entrada)
+);
+create index on public.marcas_asistencia (empleado_id, entrada);
+
+create table public.horas_extra (
+  id uuid primary key default gen_random_uuid(),
+  empresa_id uuid not null references public.empresas(id) on delete cascade,
+  empleado_id uuid not null references public.empleados(id) on delete cascade,
+  fecha date not null,
+  horas numeric(6,2) not null check (horas > 0),
+  tipo text not null default 'diurna' check (tipo in ('diurna','nocturna','mixta','feriado')),
+  factor numeric(4,2) not null default 1.5,
+  tarifa_hora numeric(14,2),
+  monto numeric(14,2) not null check (monto >= 0),
+  afecto_ccss boolean not null default true,
+  origen text not null default 'manual' check (origen in ('manual','importado','automatico')),
+  estado text not null default 'pendiente' check (estado in ('pendiente','aprobada','rechazada','pagada')),
+  boleta_id uuid,
+  creado_en timestamptz not null default now()
+);
+create index on public.horas_extra (empleado_id, fecha);
+
+create table public.incapacidades (
+  id uuid primary key default gen_random_uuid(),
+  empresa_id uuid not null references public.empresas(id) on delete cascade,
+  empleado_id uuid not null references public.empleados(id) on delete cascade,
+  tipo text not null check (tipo in ('ccss','ins','maternity')),
+  desde date not null,
+  hasta date not null,
+  porcentaje_subsidio numeric(5,2) not null default 60,
+  numero_boleta text,
+  es_prorroga boolean not null default false,
+  medio_dia_extra boolean not null default false,
+  maternidad_ccss_por_patrono boolean not null default false,
+  maternidad_50_50 boolean not null default false,
+  salario_diario numeric(14,2),          -- nulo = salario mensual / 30
+  salario_promedio_diario numeric(14,2), -- maternidad
+  estado text not null default 'confirmada' check (estado in ('borrador','confirmada','anulada')),
+  creado_en timestamptz not null default now(),
+  check (hasta >= desde)
+);
+create index on public.incapacidades (empleado_id, desde);
+
+create table public.permisos (
+  id uuid primary key default gen_random_uuid(),
+  empresa_id uuid not null references public.empresas(id) on delete cascade,
+  empleado_id uuid not null references public.empleados(id) on delete cascade,
+  tipo text not null default 'personal',
+  desde date not null,
+  hasta date not null,
+  dias numeric(6,2) not null,
+  con_goce boolean not null default false,
+  monto numeric(14,2),                     -- nulo = días x salario diario
+  ausencia boolean not null default false, -- ausencia injustificada (no permiso)
+  fundamento text,
+  estado text not null default 'aprobado' check (estado in ('pendiente','aprobado','rechazado')),
+  creado_en timestamptz not null default now(),
+  check (hasta >= desde)
+);
+
+create table public.vacaciones (
+  id uuid primary key default gen_random_uuid(),
+  empresa_id uuid not null references public.empresas(id) on delete cascade,
+  empleado_id uuid not null references public.empleados(id) on delete cascade,
+  tipo text not null default 'disfrute' check (tipo in ('disfrute','dinero')),
+  desde date,
+  hasta date,
+  dias numeric(6,2) not null check (dias > 0),
+  monto numeric(14,2),   -- solo pago en dinero; nulo = días x salario diario
+  estado text not null default 'solicitada' check (estado in ('solicitada','aprobada','rechazada','pagada')),
+  boleta_id uuid,
+  solicitada_por uuid default auth.uid(),
+  creado_en timestamptz not null default now()
+);
+
+create table public.bonos (
+  id uuid primary key default gen_random_uuid(),
+  empresa_id uuid not null references public.empresas(id) on delete cascade,
+  empleado_id uuid not null references public.empleados(id) on delete cascade,
+  nombre text not null,
+  monto numeric(14,2) not null check (monto >= 0),
+  afecto_ccss boolean not null default true,
+  afecto_salario_base boolean not null default true,
+  recurrente boolean not null default false,
+  desde date not null,
+  hasta date,
+  activo boolean not null default true,
+  creado_en timestamptz not null default now()
+);
+
+-- Cargos y otras deducciones (sindicato, cooperativa, adelantos, uniformes...)
+create table public.otras_deducciones (
+  id uuid primary key default gen_random_uuid(),
+  empresa_id uuid not null references public.empresas(id) on delete cascade,
+  empleado_id uuid not null references public.empleados(id) on delete cascade,
+  descripcion text not null,
+  monto numeric(14,2) not null check (monto >= 0),
+  recurrente boolean not null default false,
+  desde date not null,
+  hasta date,
+  activo boolean not null default true,
+  creado_en timestamptz not null default now()
+);
+
+create table public.rebajos_renta (
+  id uuid primary key default gen_random_uuid(),
+  empresa_id uuid not null references public.empresas(id) on delete cascade,
+  empleado_id uuid not null references public.empleados(id) on delete cascade,
+  desde date not null,
+  hasta date not null,
+  monto numeric(14,2) not null,
+  motivo text
+);
+
+-- ------------------------------------------------------------- Obligaciones --
+create table public.prestamos (
+  id uuid primary key default gen_random_uuid(),
+  empresa_id uuid not null references public.empresas(id) on delete cascade,
+  empleado_id uuid not null references public.empleados(id) on delete cascade,
+  descripcion text not null default 'Préstamo',
+  monto numeric(14,2) not null check (monto > 0),
+  cuota numeric(14,2) not null check (cuota > 0),
+  saldo numeric(14,2) not null,
+  fecha_otorgado date not null default current_date,
+  primera_rebaja date not null,
+  estado text not null default 'activo' check (estado in ('activo','pausado','pagado','anulado')),
+  creado_en timestamptz not null default now()
+);
+
+create table public.prestamo_pagos (
+  id uuid primary key default gen_random_uuid(),
+  empresa_id uuid not null references public.empresas(id) on delete cascade,
+  prestamo_id uuid not null references public.prestamos(id) on delete cascade,
+  boleta_id uuid,
+  fecha date not null,
+  monto numeric(14,2) not null,
+  creado_en timestamptz not null default now()
+);
+
+create table public.embargos (
+  id uuid primary key default gen_random_uuid(),
+  empresa_id uuid not null references public.empresas(id) on delete cascade,
+  empleado_id uuid not null references public.empleados(id) on delete cascade,
+  expediente text not null,
+  juzgado text,
+  beneficiario text,
+  cuenta text,
+  tipo text not null check (tipo in ('fijo','porcentaje')),
+  valor numeric(14,2) not null check (valor > 0),
+  desde date not null,
+  hasta date,
+  estado text not null default 'activo' check (estado in ('activo','suspendido','finalizado')),
+  creado_en timestamptz not null default now(),
+  check (tipo = 'fijo' or valor <= 25)
+);
+
+create table public.pensiones_alimentarias (
+  id uuid primary key default gen_random_uuid(),
+  empresa_id uuid not null references public.empresas(id) on delete cascade,
+  empleado_id uuid not null references public.empleados(id) on delete cascade,
+  expediente text not null,
+  juzgado text,
+  beneficiario text,
+  relacion text,
+  cuenta text,
+  tipo text not null check (tipo in ('fijo','porcentaje')),
+  valor numeric(14,2) not null check (valor > 0),
+  desde date not null,
+  hasta date,
+  estado text not null default 'activo' check (estado in ('activo','suspendido','finalizado')),
+  creado_en timestamptz not null default now()
+);
+
+-- ------------------------------------------------------------------ RLS ------
+select public._politicas_empresa(t::regclass) from unnest(array[
+  'public.empleados','public.historial_salarial','public.documentos_empleado','public.movimientos_empleado',
+  'public.marcas_asistencia','public.horas_extra','public.incapacidades','public.permisos','public.vacaciones',
+  'public.bonos','public.otras_deducciones','public.rebajos_renta','public.prestamos','public.prestamo_pagos',
+  'public.embargos','public.pensiones_alimentarias']) t;
+
+-- Portal del empleado: ve su ficha y sus vacaciones, y puede solicitar vacaciones.
+create policy empleado_ve_su_ficha on public.empleados for select to authenticated
+  using (usuario_id = auth.uid());
+create policy empleado_ve_sus_vacaciones on public.vacaciones for select to authenticated
+  using (exists (select 1 from public.empleados e where e.id = empleado_id and e.usuario_id = auth.uid()));
+create policy empleado_solicita_vacaciones on public.vacaciones for insert to authenticated
+  with check (estado = 'solicitada' and exists (
+    select 1 from public.empleados e where e.id = empleado_id and e.empresa_id = vacaciones.empresa_id
+      and e.usuario_id = auth.uid()));
+
+-- Auditoría de datos sensibles
+create trigger auditar after insert or update or delete on public.empleados for each row execute function public.tg_auditar();
+create trigger auditar after insert or update or delete on public.historial_salarial for each row execute function public.tg_auditar();
+create trigger auditar after insert or update or delete on public.prestamos for each row execute function public.tg_auditar();
+create trigger auditar after insert or update or delete on public.embargos for each row execute function public.tg_auditar();
+create trigger auditar after insert or update or delete on public.pensiones_alimentarias for each row execute function public.tg_auditar();
+
+
+-- >>>>>>>>>>>>>>>>>>>>>>>> 20261009000300_planillas.sql
+-- =============================================================================
+-- Planilla Costa Rica · 0003 Planillas, boletas, aguinaldo, liquidaciones y asientos
+-- Los montos los escribe únicamente la API (que llama al motor). La base
+-- protege las reglas que no pueden fallar: estados, aprobación e inmutabilidad.
+-- =============================================================================
+
+create table public.planillas (
+  id uuid primary key default gen_random_uuid(),
+  empresa_id uuid not null references public.empresas(id) on delete cascade,
+  calendario_id uuid references public.calendarios_pago(id) on delete set null,
+  sucursal_id uuid references public.sucursales(id) on delete set null,
+  tipo text not null default 'ordinaria' check (tipo in ('ordinaria','aguinaldo','extraordinaria','liquidacion')),
+  frecuencia text not null default 'biweekly' check (frecuencia in ('monthly','biweekly','weekly','bimonthly')),
+  desde date not null,
+  hasta date not null,
+  fecha_pago date,
+  descripcion text,
+  estado text not null default 'borrador' check (estado in ('borrador','calculada','aprobada','cerrada')),
+  totales jsonb not null default '{}'::jsonb,
+  advertencias jsonb not null default '[]'::jsonb,
+  calculada_en timestamptz,
+  aprobada_por uuid,
+  aprobada_en timestamptz,
+  cerrada_por uuid,
+  cerrada_en timestamptz,
+  creado_en timestamptz not null default now(),
+  creado_por uuid default auth.uid(),
+  actualizado_en timestamptz not null default now(),
+  actualizado_por uuid,
+  check (hasta >= desde)
+);
+create index on public.planillas (empresa_id, desde desc);
+create trigger planillas_upd before update on public.planillas
+  for each row execute function public.tg_actualizado();
+
+create table public.boletas (
+  id uuid primary key default gen_random_uuid(),
+  empresa_id uuid not null references public.empresas(id) on delete cascade,
+  planilla_id uuid not null references public.planillas(id) on delete cascade,
+  empleado_id uuid not null references public.empleados(id) on delete restrict,
+  salario_base numeric(14,2) not null default 0,
+  horas_extra numeric(14,2) not null default 0,
+  vacaciones numeric(14,2) not null default 0,
+  bonos numeric(14,2) not null default 0,
+  bruto numeric(14,2) not null default 0,
+  base_cotizable numeric(14,2) not null default 0,
+  base_ccss numeric(14,2) not null default 0,
+  ccss_obrero numeric(14,2) not null default 0,
+  renta numeric(14,2) not null default 0,
+  creditos_renta numeric(14,2) not null default 0,
+  rop_obrero numeric(14,2) not null default 0,
+  total_deducciones numeric(14,2) not null default 0,
+  subsidio_ccss numeric(14,2) not null default 0,
+  subsidio_ins numeric(14,2) not null default 0,
+  costo_patrono_incapacidad numeric(14,2) not null default 0,
+  neto numeric(14,2) not null default 0,
+  ccss_patronal numeric(14,2) not null default 0,
+  ins_patronal numeric(14,2) not null default 0,
+  rop_patronal numeric(14,2) not null default 0,
+  prov_aguinaldo numeric(14,2) not null default 0,
+  prov_cesantia numeric(14,2) not null default 0,
+  prov_vacaciones numeric(14,2) not null default 0,
+  costo_total_patrono numeric(14,2) not null default 0,
+  dias_incapacidad numeric(6,2) not null default 0,
+  resultado jsonb not null default '{}'::jsonb,   -- salida completa del motor
+  entrada jsonb not null default '{}'::jsonb,     -- datos con que se calculó
+  parametros jsonb not null default '{}'::jsonb,  -- fotografía de tasas usadas
+  version_motor text,
+  creado_en timestamptz not null default now(),
+  unique (planilla_id, empleado_id)
+);
+create index on public.boletas (empresa_id, empleado_id);
+
+create table public.boleta_lineas (
+  id uuid primary key default gen_random_uuid(),
+  empresa_id uuid not null references public.empresas(id) on delete cascade,
+  boleta_id uuid not null references public.boletas(id) on delete cascade,
+  tipo text not null check (tipo in ('ingreso','deduccion','patronal')),
+  categoria text not null,
+  codigo text,
+  descripcion text not null,
+  base numeric(14,2),
+  tasa numeric(9,6),
+  monto numeric(14,2) not null,
+  referencia_id uuid,   -- préstamo, embargo, bono... que la originó
+  orden int not null default 0
+);
+create index on public.boleta_lineas (boleta_id);
+
+create table public.reaperturas (
+  id uuid primary key default gen_random_uuid(),
+  empresa_id uuid not null references public.empresas(id) on delete cascade,
+  planilla_id uuid not null references public.planillas(id) on delete cascade,
+  motivo text not null check (length(trim(motivo)) >= 5),
+  usuario_id uuid default auth.uid(),
+  fecha timestamptz not null default now()
+);
+
+create table public.envios_boleta (
+  id uuid primary key default gen_random_uuid(),
+  empresa_id uuid not null references public.empresas(id) on delete cascade,
+  boleta_id uuid not null references public.boletas(id) on delete cascade,
+  canal text not null default 'correo' check (canal in ('correo','telegram','portal')),
+  destino text,
+  estado text not null check (estado in ('enviado','error','omitido')),
+  error text,
+  fecha timestamptz not null default now()
+);
+
+-- ------------------------------------------------------- Reglas de estados --
+-- borrador -> calculada -> aprobada -> cerrada ; cerrada -> calculada (reabrir)
+create or replace function public.tg_planilla_estados() returns trigger
+language plpgsql as $$
+declare
+  ok boolean;
+begin
+  if new.estado is not distinct from old.estado then
+    if old.estado in ('aprobada','cerrada') and current_user = 'authenticated'
+       and (new.desde, new.hasta, new.tipo, new.frecuencia, new.totales)
+           is distinct from (old.desde, old.hasta, old.tipo, old.frecuencia, old.totales) then
+      raise exception 'La planilla está %; no se puede modificar', old.estado;
+    end if;
+    return new;
+  end if;
+
+  ok := (old.estado, new.estado) in (
+    ('borrador','calculada'), ('calculada','calculada'), ('calculada','borrador'),
+    ('calculada','aprobada'), ('aprobada','calculada'), ('aprobada','cerrada'),
+    ('cerrada','calculada'));
+  if not ok then
+    raise exception 'Cambio de estado no permitido: % -> %', old.estado, new.estado;
+  end if;
+
+  if current_user = 'authenticated' and new.estado in ('aprobada','cerrada')
+     and not public.puede_aprobar(new.empresa_id) then
+    raise exception 'Solo un aprobador puede % la planilla',
+      case new.estado when 'aprobada' then 'aprobar' else 'cerrar' end;
+  end if;
+
+  if old.estado = 'cerrada' then
+    if current_user = 'authenticated' and not public.puede_aprobar(new.empresa_id) then
+      raise exception 'Solo un aprobador puede reabrir una planilla cerrada';
+    end if;
+    if not exists (select 1 from public.reaperturas r where r.planilla_id = new.id
+                   and r.fecha >= coalesce(old.cerrada_en, '-infinity')) then
+      raise exception 'Para reabrir registre primero el motivo en reaperturas';
+    end if;
+  end if;
+
+  if new.estado = 'aprobada' then new.aprobada_por := auth.uid(); new.aprobada_en := now(); end if;
+  if new.estado = 'cerrada' then new.cerrada_por := auth.uid(); new.cerrada_en := now(); end if;
+  return new;
+end $$;
+create trigger planilla_estados before update on public.planillas
+  for each row execute function public.tg_planilla_estados();
+
+create or replace function public.tg_planilla_no_borrar() returns trigger
+language plpgsql as $$
+begin
+  if old.estado in ('aprobada','cerrada') then
+    raise exception 'No se puede borrar una planilla %', old.estado;
+  end if;
+  return old;
+end $$;
+create trigger planilla_no_borrar before delete on public.planillas
+  for each row execute function public.tg_planilla_no_borrar();
+
+-- Boletas y líneas: solo cambian mientras la planilla está en borrador/calculada.
+create or replace function public.tg_boleta_inmutable() returns trigger
+language plpgsql as $$
+declare
+  v_planilla uuid;
+  v_estado text;
+begin
+  if tg_table_name = 'boletas' then
+    v_planilla := coalesce(new.planilla_id, old.planilla_id);
+  else
+    select b.planilla_id into v_planilla from public.boletas b where b.id = coalesce(new.boleta_id, old.boleta_id);
+  end if;
+  select estado into v_estado from public.planillas where id = v_planilla;
+  if v_estado in ('aprobada','cerrada') then
+    raise exception 'La planilla está %: las boletas no se pueden modificar', v_estado;
+  end if;
+  return coalesce(new, old);
+end $$;
+create trigger boleta_inmutable before insert or update or delete on public.boletas
+  for each row execute function public.tg_boleta_inmutable();
+create trigger linea_inmutable before insert or update or delete on public.boleta_lineas
+  for each row execute function public.tg_boleta_inmutable();
+
+-- ------------------------------------------------- Aguinaldo y liquidaciones --
+create table public.aguinaldos (
+  id uuid primary key default gen_random_uuid(),
+  empresa_id uuid not null references public.empresas(id) on delete cascade,
+  anio int not null,
+  empleado_id uuid not null references public.empleados(id) on delete restrict,
+  detalle jsonb not null default '[]'::jsonb,   -- salarios por mes dic..nov
+  total_salarios numeric(14,2) not null,
+  monto numeric(14,2) not null,
+  planilla_id uuid references public.planillas(id) on delete set null,
+  estado text not null default 'calculado' check (estado in ('calculado','aprobado','pagado')),
+  creado_en timestamptz not null default now(),
+  unique (empresa_id, anio, empleado_id)
+);
+
+create table public.liquidaciones (
+  id uuid primary key default gen_random_uuid(),
+  empresa_id uuid not null references public.empresas(id) on delete cascade,
+  empleado_id uuid not null references public.empleados(id) on delete restrict,
+  fecha_salida date not null,
+  motivo text not null check (motivo in ('renuncia','despido_sin_responsabilidad','despido_con_responsabilidad',
+                                          'mutuo_acuerdo','pension','fallecimiento','fin_contrato')),
+  preaviso_otorgado boolean not null default false,
+  detalle jsonb not null default '{}'::jsonb,
+  salario_promedio numeric(14,2) not null default 0,
+  preaviso numeric(14,2) not null default 0,
+  cesantia numeric(14,2) not null default 0,
+  vacaciones numeric(14,2) not null default 0,
+  aguinaldo numeric(14,2) not null default 0,
+  otros_pagos numeric(14,2) not null default 0,
+  deducciones numeric(14,2) not null default 0,
+  total numeric(14,2) not null default 0,
+  estado text not null default 'borrador' check (estado in ('borrador','aprobada','pagada','anulada')),
+  aprobada_por uuid,
+  creado_en timestamptz not null default now(),
+  creado_por uuid default auth.uid()
+);
+
+-- --------------------------------------------------------------- Asientos ----
+create table public.cuentas_contables (
+  id uuid primary key default gen_random_uuid(),
+  empresa_id uuid not null references public.empresas(id) on delete cascade,
+  concepto text not null,          -- gasto_salarios, ccss_por_pagar, ...
+  codigo text not null,
+  nombre text not null,
+  centro_costo text,
+  unique (empresa_id, concepto)
+);
+
+create table public.asientos (
+  id uuid primary key default gen_random_uuid(),
+  empresa_id uuid not null references public.empresas(id) on delete cascade,
+  origen text not null check (origen in ('planilla','liquidacion','aguinaldo','vacaciones','manual')),
+  origen_id uuid,
+  fecha date not null,
+  descripcion text not null,
+  total_debito numeric(14,2) not null,
+  total_credito numeric(14,2) not null,
+  estado text not null default 'vigente' check (estado in ('vigente','reemplazado')),
+  exportado_en timestamptz,
+  creado_en timestamptz not null default now(),
+  check (total_debito = total_credito)
+);
+
+create table public.asiento_lineas (
+  id uuid primary key default gen_random_uuid(),
+  empresa_id uuid not null references public.empresas(id) on delete cascade,
+  asiento_id uuid not null references public.asientos(id) on delete cascade,
+  cuenta_codigo text not null,
+  cuenta_nombre text not null,
+  descripcion text,
+  sucursal_id uuid,
+  empleado_id uuid,
+  debito numeric(14,2) not null default 0,
+  credito numeric(14,2) not null default 0,
+  orden int not null default 0
+);
+
+-- ------------------------------------------------------------------ RLS ------
+select public._politicas_empresa(t::regclass) from unnest(array[
+  'public.planillas','public.boletas','public.boleta_lineas','public.reaperturas','public.envios_boleta',
+  'public.aguinaldos','public.liquidaciones','public.cuentas_contables','public.asientos','public.asiento_lineas']) t;
+
+-- Portal del empleado: sus boletas de planillas cerradas.
+create policy empleado_ve_sus_boletas on public.boletas for select to authenticated using (
+  exists (select 1 from public.empleados e where e.id = empleado_id and e.usuario_id = auth.uid())
+  and exists (select 1 from public.planillas p where p.id = planilla_id and p.estado = 'cerrada'));
+create policy empleado_ve_sus_lineas on public.boleta_lineas for select to authenticated using (
+  exists (select 1 from public.boletas b where b.id = boleta_id));
+
+create trigger auditar after insert or update or delete on public.planillas for each row execute function public.tg_auditar();
+create trigger auditar after insert or update or delete on public.reaperturas for each row execute function public.tg_auditar();
+create trigger auditar after insert or update or delete on public.liquidaciones for each row execute function public.tg_auditar();
+
+
+-- >>>>>>>>>>>>>>>>>>>>>>>> 20261009000400_negocio_autogestion.sql
+-- =============================================================================
+-- Planilla Costa Rica · 0004 SaaS, administración de A.U.R.O.M., socios y autogestión
+-- (Fases 6, 7 y 8)
+-- =============================================================================
+
+-- ------------------------------------------------------------ Fase 6: SaaS --
+-- Alta de una empresa nueva: crea la empresa, deja al usuario como admin,
+-- configuración por defecto, calendario y cuentas contables, y (si viene un
+-- código de referido) asigna al socio como contador de soporte.
+create or replace function public.crear_empresa(
+  p_nombre text, p_cedula text default null, p_codigo_referido text default null,
+  p_frecuencia text default 'biweekly'
+) returns uuid
+language plpgsql security definer set search_path = public as $$
+declare
+  v_empresa uuid;
+  v_socio uuid;
+  v_tipo text;
+begin
+  if auth.uid() is null then raise exception 'Debe iniciar sesión'; end if;
+  if p_codigo_referido is not null then
+    select id, tipo into v_socio, v_tipo from socios
+     where codigo_referido = upper(trim(p_codigo_referido)) and estado = 'activo';
+  end if;
+
+  insert into empresas (nombre, cedula_juridica, estado_servicio, referido_por, creado_por)
+  values (p_nombre, p_cedula, 'prueba', v_socio, auth.uid()) returning id into v_empresa;
+  insert into usuarios_empresa (empresa_id, usuario_id, rol, creado_por) values (v_empresa, auth.uid(), 'admin', auth.uid());
+  insert into configuracion_planilla (empresa_id) values (v_empresa);
+  insert into calendarios_pago (empresa_id, nombre, frecuencia)
+  values (v_empresa, case p_frecuencia when 'monthly' then 'Mensual' when 'weekly' then 'Semanal' else 'Quincenal' end, p_frecuencia);
+  perform crear_cuentas_por_defecto(v_empresa);
+
+  if v_socio is not null then
+    insert into asignaciones_contador (empresa_id, socio_id, funciones, permiso, soporte_principal, asignado_por)
+    values (v_empresa, v_socio,
+            case v_tipo when 'contador' then array['supervision','soporte','implementacion']
+                        else array['ventas','implementacion'] end,
+            'operacion', v_tipo = 'contador', auth.uid());
+  end if;
+  return v_empresa;
+end $$;
+grant execute on function public.crear_empresa(text, text, text, text) to authenticated;
+
+create or replace function public.crear_cuentas_por_defecto(p_empresa uuid) returns void
+language sql security definer set search_path = public as $$
+  insert into cuentas_contables (empresa_id, concepto, codigo, nombre) values
+    (p_empresa, 'gasto_salarios',        '5101', 'Sueldos y salarios'),
+    (p_empresa, 'gasto_cargas_sociales', '5102', 'Cargas sociales patronales'),
+    (p_empresa, 'gasto_aguinaldo',       '5103', 'Aguinaldo'),
+    (p_empresa, 'gasto_vacaciones',      '5104', 'Vacaciones'),
+    (p_empresa, 'gasto_cesantia',        '5105', 'Cesantía'),
+    (p_empresa, 'gasto_incapacidades',   '5106', 'Incapacidades a cargo del patrono'),
+    (p_empresa, 'salarios_por_pagar',    '2101', 'Salarios por pagar'),
+    (p_empresa, 'ccss_por_pagar',        '2102', 'CCSS por pagar'),
+    (p_empresa, 'ins_por_pagar',         '2103', 'INS riesgos del trabajo por pagar'),
+    (p_empresa, 'renta_por_pagar',       '2104', 'Impuesto al salario retenido'),
+    (p_empresa, 'rop_por_pagar',         '2105', 'ROP por pagar'),
+    (p_empresa, 'embargos_por_pagar',    '2106', 'Embargos y pensiones por pagar'),
+    (p_empresa, 'otras_retenciones',     '2107', 'Otras retenciones a empleados'),
+    (p_empresa, 'prov_aguinaldo',        '2111', 'Provisión aguinaldo'),
+    (p_empresa, 'prov_vacaciones',       '2112', 'Provisión vacaciones'),
+    (p_empresa, 'prov_cesantia',         '2113', 'Provisión cesantía'),
+    (p_empresa, 'prestamos_empleados',   '1205', 'Préstamos a empleados'),
+    (p_empresa, 'subsidios_por_cobrar',  '1206', 'Subsidios CCSS por cobrar')
+  on conflict (empresa_id, concepto) do nothing
+$$;
+
+-- ----------------------------------------- Socios: prospectos y comisiones --
+create table public.prospectos (
+  id uuid primary key default gen_random_uuid(),
+  socio_id uuid not null references public.socios(id) on delete cascade,
+  empresa_nombre text not null,
+  contacto text,
+  correo text,
+  telefono text,
+  registrado_en timestamptz not null default now(),
+  vence_atribucion date not null default (current_date + 90),
+  empresa_id uuid references public.empresas(id) on delete set null,
+  estado text not null default 'abierto' check (estado in ('abierto','convertido','perdido','vencido'))
+);
+create index on public.prospectos (lower(empresa_nombre));
+
+create table public.comisiones (
+  id uuid primary key default gen_random_uuid(),
+  socio_id uuid not null references public.socios(id) on delete restrict,
+  empresa_id uuid not null references public.empresas(id) on delete restrict,
+  concepto text not null check (concepto in ('implementacion','mensualidad_vendedor','recurrente_contador')),
+  periodo date not null,                  -- primer día del mes
+  base numeric(14,2) not null,            -- pago del cliente sin IVA
+  porcentaje numeric(6,3),
+  monto numeric(14,2) not null,
+  cobro_id uuid,                          -- pago del cliente que la origina
+  liquidacion_id uuid,
+  estado text not null default 'pendiente' check (estado in ('pendiente','liquidada','anulada')),
+  creado_en timestamptz not null default now(),
+  unique (socio_id, empresa_id, concepto, periodo)
+);
+
+create table public.liquidaciones_socio (
+  id uuid primary key default gen_random_uuid(),
+  socio_id uuid not null references public.socios(id) on delete restrict,
+  mes date not null,
+  total numeric(14,2) not null,
+  factura_xml_path text,
+  pagado_en timestamptz,
+  referencia_pago text,
+  gasto_id uuid,
+  creado_en timestamptz not null default now(),
+  unique (socio_id, mes)
+);
+
+alter table public.prospectos enable row level security;
+create policy ver on public.prospectos for select to authenticated using (socio_id = public.mi_socio_id() or public.es_admin_plataforma());
+create policy crear on public.prospectos for insert to authenticated with check (socio_id = public.mi_socio_id() or public.es_admin_plataforma());
+create policy editar on public.prospectos for update to authenticated using (public.es_admin_plataforma());
+grant select, insert, update on public.prospectos to authenticated;
+
+alter table public.comisiones enable row level security;
+create policy ver on public.comisiones for select to authenticated using (socio_id = public.mi_socio_id() or public.es_admin_plataforma());
+create policy gestionar on public.comisiones for all to authenticated using (public.es_admin_plataforma()) with check (public.es_admin_plataforma());
+grant select, insert, update, delete on public.comisiones to authenticated;
+
+alter table public.liquidaciones_socio enable row level security;
+create policy ver on public.liquidaciones_socio for select to authenticated using (socio_id = public.mi_socio_id() or public.es_admin_plataforma());
+create policy gestionar on public.liquidaciones_socio for all to authenticated using (public.es_admin_plataforma()) with check (public.es_admin_plataforma());
+grant select, insert, update, delete on public.liquidaciones_socio to authenticated;
+
+-- ------------------------------------------------- Soporte (bot + tickets) --
+create table public.articulos_ayuda (
+  id uuid primary key default gen_random_uuid(),
+  titulo text not null,
+  contenido text not null,
+  categoria text,
+  palabras_clave text[] not null default '{}',
+  publicado boolean not null default true,
+  version int not null default 1,
+  actualizado_en timestamptz not null default now(),
+  actualizado_por uuid
+);
+create trigger articulos_upd before update on public.articulos_ayuda for each row execute function public.tg_actualizado();
+
+create table public.tickets (
+  id uuid primary key default gen_random_uuid(),
+  empresa_id uuid not null references public.empresas(id) on delete cascade,
+  usuario_id uuid default auth.uid(),
+  canal text not null default 'web' check (canal in ('web','telegram','correo')),
+  asunto text not null,
+  estado text not null default 'abierto' check (estado in ('abierto','en_proceso','escalado','resuelto','cerrado')),
+  prioridad text not null default 'normal' check (prioridad in ('baja','normal','alta','urgente')),
+  -- Soporte de primer nivel: el contador asignado. Si no resuelve, se escala a la plataforma.
+  asignado_socio_id uuid references public.socios(id) on delete set null,
+  nivel text not null default 'contador' check (nivel in ('bot','contador','plataforma')),
+  resuelto_por text check (resuelto_por in ('bot','contador','plataforma')),
+  minutos_invertidos int not null default 0,
+  creado_en timestamptz not null default now(),
+  actualizado_en timestamptz not null default now(),
+  actualizado_por uuid
+);
+create trigger tickets_upd before update on public.tickets for each row execute function public.tg_actualizado();
+
+-- Al crear un ticket se asigna al contador de soporte principal de la empresa.
+create or replace function public.tg_ticket_asignar() returns trigger
+language plpgsql security definer set search_path = public as $$
+begin
+  if new.asignado_socio_id is null then
+    select a.socio_id into new.asignado_socio_id
+      from asignaciones_contador a
+     where a.empresa_id = new.empresa_id and a.revocado_en is null
+       and 'soporte' = any(a.funciones)
+     order by a.soporte_principal desc, a.desde
+     limit 1;
+  end if;
+  if new.asignado_socio_id is null and new.nivel = 'contador' then
+    new.nivel := 'plataforma';
+  end if;
+  return new;
+end $$;
+create trigger ticket_asignar before insert on public.tickets for each row execute function public.tg_ticket_asignar();
+
+create table public.mensajes_ticket (
+  id uuid primary key default gen_random_uuid(),
+  empresa_id uuid not null references public.empresas(id) on delete cascade,
+  ticket_id uuid not null references public.tickets(id) on delete cascade,
+  autor text not null check (autor in ('cliente','bot','contador','plataforma')),
+  usuario_id uuid default auth.uid(),
+  texto text not null,
+  adjuntos jsonb not null default '[]'::jsonb,
+  creado_en timestamptz not null default clock_timestamp()   -- orden estable dentro de una transacción
+);
+
+-- Tickets: el cliente no puede reasignar ni cambiar el nivel a su gusto.
+-- Solo se permite escalar (contador -> plataforma); reasignar es de la plataforma o del admin de la empresa.
+create or replace function public.tg_ticket_campos() returns trigger
+language plpgsql as $$
+begin
+  if current_user <> 'authenticated' or public.es_admin_plataforma() then
+    return new;
+  end if;
+  if new.empresa_id is distinct from old.empresa_id then
+    raise exception 'No se puede mover un ticket de empresa';
+  end if;
+  if new.asignado_socio_id is distinct from old.asignado_socio_id and not public.es_admin_empresa(new.empresa_id) then
+    raise exception 'Solo el administrador de la empresa o la plataforma reasignan tickets';
+  end if;
+  if new.nivel is distinct from old.nivel and not (old.nivel in ('bot','contador') and new.nivel = 'plataforma') then
+    raise exception 'Un ticket solo se puede escalar a la plataforma';
+  end if;
+  if (new.minutos_invertidos, new.resuelto_por) is distinct from (old.minutos_invertidos, old.resuelto_por)
+     and old.asignado_socio_id is distinct from public.mi_socio_id() then
+    raise exception 'Solo quien atiende el ticket registra la solución';
+  end if;
+  return new;
+end $$;
+create trigger ticket_campos before update on public.tickets for each row execute function public.tg_ticket_campos();
+
+alter table public.articulos_ayuda enable row level security;
+create policy ver on public.articulos_ayuda for select to authenticated using (publicado or public.es_admin_plataforma());
+create policy gestionar on public.articulos_ayuda for all to authenticated using (public.es_admin_plataforma()) with check (public.es_admin_plataforma());
+grant select, insert, update, delete on public.articulos_ayuda to authenticated;
+
+-- Tickets: los ve la empresa, su contador asignado (por la asignación) y la plataforma.
+-- Cualquiera con acceso a la empresa (incluido rol lectura) puede abrir un ticket.
+alter table public.tickets enable row level security;
+create policy ver on public.tickets for select to authenticated using (public.puede_ver(empresa_id));
+create policy crear on public.tickets for insert to authenticated with check (public.puede_ver(empresa_id));
+create policy editar on public.tickets for update to authenticated using (public.puede_ver(empresa_id)) with check (public.puede_ver(empresa_id));
+grant select, insert, update on public.tickets to authenticated;
+alter table public.mensajes_ticket enable row level security;
+create policy ver on public.mensajes_ticket for select to authenticated using (public.puede_ver(empresa_id));
+create policy crear on public.mensajes_ticket for insert to authenticated with check (public.puede_ver(empresa_id));
+grant select, insert on public.mensajes_ticket to authenticated;
+
+-- ---------------------------------------------- Telegram y alertas --------
+create table public.telegram_vinculos (
+  id uuid primary key default gen_random_uuid(),
+  usuario_id uuid not null references auth.users(id) on delete cascade,
+  chat_id text,
+  codigo_vinculacion text not null unique default upper(substr(md5(gen_random_uuid()::text), 1, 6)),
+  rol text not null default 'cliente' check (rol in ('duena','cliente','socio')),
+  avisos jsonb not null default '{"boletas": true, "recordatorios": true}'::jsonb,
+  activo boolean not null default false,
+  creado_en timestamptz not null default now()
+);
+alter table public.telegram_vinculos enable row level security;
+create policy propio on public.telegram_vinculos for all to authenticated
+  using (usuario_id = auth.uid() or public.es_admin_plataforma())
+  with check (usuario_id = auth.uid() or public.es_admin_plataforma());
+grant select, insert, update, delete on public.telegram_vinculos to authenticated;
+
+-- =============================================================================
+-- Esquema "negocio": administración interna de A.U.R.O.M. (solo la dueña)
+-- =============================================================================
+create schema if not exists negocio;
+grant usage on schema negocio to authenticated;
+
+create table negocio.clientes (
+  id uuid primary key default gen_random_uuid(),
+  empresa_id uuid unique references public.empresas(id) on delete set null,
+  razon_social text not null,
+  tipo_identificacion text not null default '02' check (tipo_identificacion in ('01','02','03','04')), -- física, jurídica, DIMEX, NITE
+  identificacion text not null,
+  correo_facturacion text not null,
+  telefono text,
+  actividad_receptor text,
+  precio_mensual numeric(14,2) not null default 55000,   -- sin IVA
+  moneda text not null default 'CRC' check (moneda in ('CRC','USD')),
+  precio_fundador_hasta date,                             -- clientes Odoo: US$100 por 12 meses
+  empleados_incluidos int not null default 50,
+  precio_bloque_10 numeric(14,2) not null default 11000,
+  implementacion numeric(14,2) not null default 100000,
+  dia_cobro int not null default 1 check (dia_cobro between 1 and 28),
+  estado text not null default 'activo' check (estado in ('prueba','activo','gracia','solo_lectura','suspendido','baja')),
+  alta date not null default current_date,
+  baja date,
+  creado_en timestamptz not null default now()
+);
+
+create table negocio.comprobantes (
+  id uuid primary key default gen_random_uuid(),
+  tipo text not null check (tipo in ('01','02','03','04')),  -- factura, nota débito, nota crédito, tiquete
+  clave char(50) unique,
+  consecutivo char(20) unique,
+  fecha timestamptz not null default now(),
+  cliente_id uuid references negocio.clientes(id),
+  periodo date,
+  condicion_venta text not null default '01',
+  medio_pago text not null default '04',     -- 04 transferencia/SINPE, 02 tarjeta
+  moneda text not null default 'CRC',
+  tipo_cambio numeric(12,5) not null default 1,
+  subtotal numeric(14,2) not null,
+  impuesto numeric(14,2) not null,
+  total numeric(14,2) not null,
+  referencia_id uuid references negocio.comprobantes(id),   -- notas de crédito
+  xml_firmado text,
+  respuesta_hacienda text,
+  estado text not null default 'borrador'
+    check (estado in ('borrador','firmado','enviado','aceptado','rechazado','error','anulado')),
+  mensaje_estado text,
+  enviado_por_correo_en timestamptz,
+  creado_en timestamptz not null default now()
+);
+
+create table negocio.comprobante_lineas (
+  id uuid primary key default gen_random_uuid(),
+  comprobante_id uuid not null references negocio.comprobantes(id) on delete cascade,
+  numero int not null,
+  cabys char(13) not null,
+  descripcion text not null,
+  cantidad numeric(12,3) not null default 1,
+  unidad text not null default 'Sp',
+  precio_unitario numeric(14,2) not null,
+  descuento numeric(14,2) not null default 0,
+  tarifa_iva numeric(5,2) not null default 13,
+  impuesto numeric(14,2) not null,
+  total numeric(14,2) not null
+);
+
+create table negocio.pagos (
+  id uuid primary key default gen_random_uuid(),
+  cliente_id uuid not null references negocio.clientes(id),
+  comprobante_id uuid references negocio.comprobantes(id),
+  fecha date not null default current_date,
+  monto numeric(14,2) not null,
+  medio text not null check (medio in ('sinpe','transferencia','tarjeta','efectivo')),
+  comision numeric(14,2) not null default 0,
+  retencion_iva numeric(14,2) not null default 0,
+  retencion_renta numeric(14,2) not null default 0,
+  referencia text,
+  creado_en timestamptz not null default now()
+);
+
+create table negocio.categorias_gasto (
+  id uuid primary key default gen_random_uuid(),
+  nombre text not null unique,
+  deducible boolean not null default true,
+  iva_acreditable boolean not null default true
+);
+
+create table negocio.gastos (
+  id uuid primary key default gen_random_uuid(),
+  fecha date not null,
+  proveedor text not null,
+  identificacion_proveedor text,
+  categoria_id uuid references negocio.categorias_gasto(id),
+  descripcion text,
+  moneda text not null default 'CRC',
+  tipo_cambio numeric(12,5) not null default 1,
+  subtotal numeric(14,2) not null,
+  iva numeric(14,2) not null default 0,
+  total numeric(14,2) not null,
+  iva_acreditable boolean not null default true,
+  deducible boolean not null default true,
+  clave_comprobante char(50),
+  xml_recibido text,
+  mensaje_receptor text check (mensaje_receptor in ('aceptado','aceptado_parcial','rechazado')),
+  creado_en timestamptz not null default now()
+);
+
+create table negocio.periodos (
+  id uuid primary key default gen_random_uuid(),
+  mes date not null unique,
+  estado text not null default 'abierto' check (estado in ('abierto','cerrado')),
+  resumen jsonb not null default '{}'::jsonb,
+  cerrado_en timestamptz
+);
+
+create table negocio.movimientos_caja (
+  id uuid primary key default gen_random_uuid(),
+  fecha date not null,
+  tipo text not null check (tipo in ('salario_duena','caja','inversion','impuesto','comision','otro')),
+  monto numeric(14,2) not null,
+  nota text
+);
+
+-- Tilopay
+create table negocio.metodos_pago (
+  id uuid primary key default gen_random_uuid(),
+  cliente_id uuid not null references negocio.clientes(id) on delete cascade,
+  proveedor text not null default 'tilopay',
+  token text not null,          -- referencia del proveedor; nunca el número de tarjeta
+  ultimos4 char(4),
+  vence text,
+  estado text not null default 'activo' check (estado in ('activo','vencido','eliminado')),
+  creado_en timestamptz not null default now()
+);
+
+create table negocio.cobros (
+  id uuid primary key default gen_random_uuid(),
+  cliente_id uuid not null references negocio.clientes(id),
+  periodo date not null,
+  empleados_facturados int not null,
+  subtotal numeric(14,2) not null,
+  iva numeric(14,2) not null,
+  total numeric(14,2) not null,
+  intento int not null default 1,
+  resultado text not null default 'pendiente' check (resultado in ('pendiente','aprobado','rechazado','error')),
+  codigo_respuesta text,
+  orden_proveedor text,
+  comision numeric(14,2) not null default 0,
+  comprobante_id uuid references negocio.comprobantes(id),
+  pago_id uuid references negocio.pagos(id),
+  creado_en timestamptz not null default now()
+);
+create unique index cobro_aprobado_unico on negocio.cobros (cliente_id, periodo) where resultado = 'aprobado';
+
+create table negocio.eventos_webhook (
+  id uuid primary key default gen_random_uuid(),
+  origen text not null check (origen in ('tilopay','telegram','hacienda')),
+  tipo text,
+  contenido jsonb not null,
+  firma_valida boolean,
+  procesado_en timestamptz,
+  error text,
+  recibido_en timestamptz not null default now()
+);
+
+create table negocio.alertas (
+  id uuid primary key default gen_random_uuid(),
+  tipo text not null check (tipo in ('pago','factura','error','caida','normativa','ticket','socio','resumen')),
+  severidad text not null default 'info' check (severidad in ('info','aviso','critica')),
+  mensaje text not null,
+  enviada_en timestamptz,
+  atendida boolean not null default false,
+  creado_en timestamptz not null default now()
+);
+
+create table negocio.cambios_normativos (
+  id uuid primary key default gen_random_uuid(),
+  fuente text not null,
+  enlace text,
+  publicado date,
+  resumen text not null,
+  parametros_propuestos jsonb,
+  vigente_desde date,
+  estado text not null default 'detectado' check (estado in ('detectado','aprobado','rechazado','aplicado')),
+  resultado_pruebas text,
+  creado_en timestamptz not null default now()
+);
+
+create table negocio.chequeos_salud (
+  id bigint generated always as identity primary key,
+  servicio text not null,
+  ok boolean not null,
+  latencia_ms int,
+  detalle text,
+  fecha timestamptz not null default now()
+);
+
+create table negocio.configuracion (
+  clave text primary key,
+  valor jsonb not null
+);
+
+-- RLS: todo el esquema negocio es solo para la dueña de la plataforma.
+do $$
+declare t text;
+begin
+  for t in select tablename from pg_tables where schemaname = 'negocio' loop
+    execute format('alter table negocio.%I enable row level security', t);
+    execute format('create policy solo_plataforma on negocio.%I for all to authenticated using (public.es_admin_plataforma()) with check (public.es_admin_plataforma())', t);
+    execute format('grant select, insert, update, delete on negocio.%I to authenticated', t);
+  end loop;
+end $$;
+
+-- El cliente puede ver sus propios comprobantes y cobros (portal de facturación).
+create policy cliente_ve_sus_comprobantes on negocio.comprobantes for select to authenticated
+  using (exists (select 1 from negocio.clientes c where c.id = cliente_id and c.empresa_id is not null and public.es_admin_empresa(c.empresa_id)));
+create policy cliente_ve_su_ficha on negocio.clientes for select to authenticated
+  using (empresa_id is not null and public.es_admin_empresa(empresa_id));
+create policy cliente_ve_sus_cobros on negocio.cobros for select to authenticated
+  using (exists (select 1 from negocio.clientes c where c.id = cliente_id and c.empresa_id is not null and public.es_admin_empresa(c.empresa_id)));
+
+grant usage on schema negocio to service_role;
+grant all on all tables in schema negocio to service_role;
+grant all on all tables in schema public to service_role;
+
+
+-- >>>>>>>>>>>>>>>>>>>>>>>> 20261009000500_semillas.sql
+-- =============================================================================
+-- Planilla Costa Rica · 0005 Datos iniciales: parámetros legales 2026, feriados,
+-- categorías de gasto y configuración del negocio.
+-- =============================================================================
+
+insert into public.parametros_legales (vigente_desde, fuente, datos) values ('2026-01-01',
+ 'Decreto 45333-H (renta); CCSS 2026; Código de Trabajo Arts. 28-29, 153',
+ '{
+   "ccss_obrero": "0.1083",
+   "ccss_obrero_pensionado_estado": "0.065",
+   "ccss_patronal": "0.2683",
+   "bmc_mensual": "333328",
+   "ins_tasas": {"I": "0.0087", "II": "0.0149", "III": "0.0247", "IV": "0.0413", "V": "0.0688"},
+   "ins_clase_defecto": "II",
+   "rop_obrero": "0.01",
+   "rop_patronal": "0.0325",
+   "prov_aguinaldo": "0.0833",
+   "prov_cesantia_defecto": "0.0533",
+   "cesantia_tabla": {"1": "19.5", "2": "20", "3": "20.5", "4": "21", "5": "21.24", "6": "21.5", "7": "22",
+                      "8": "22", "9": "22", "10": "21.5", "11": "21", "12": "20.5", "13": "20"},
+   "cesantia_max_anios": 8,
+   "tramos_renta": [
+     {"desde": "0", "hasta": "918000", "tasa": "0"},
+     {"desde": "918000", "hasta": "1347000", "tasa": "10"},
+     {"desde": "1347000", "hasta": "2364000", "tasa": "15"},
+     {"desde": "2364000", "hasta": "4727000", "tasa": "20"},
+     {"desde": "4727000", "hasta": null, "tasa": "25"}
+   ],
+   "credito_hijo": "1710",
+   "credito_conyuge": "2590",
+   "dias_mes": 30,
+   "dias_incapacidad_patrono": 3,
+   "max_pct_embargo": "25",
+   "salario_minimo_inembargable": "268731.31",
+   "edad_limite_bmc_reducida": 35
+ }'::jsonb)
+on conflict (vigente_desde) do nothing;
+
+insert into public.feriados (empresa_id, fecha, nombre, pago_obligatorio) values
+  (null, '2026-01-01', 'Año Nuevo', true),
+  (null, '2026-04-02', 'Jueves Santo', true),
+  (null, '2026-04-03', 'Viernes Santo', true),
+  (null, '2026-04-11', 'Día de Juan Santamaría', true),
+  (null, '2026-05-01', 'Día Internacional del Trabajo', true),
+  (null, '2026-07-25', 'Anexión del Partido de Nicoya', true),
+  (null, '2026-08-02', 'Día de la Virgen de los Ángeles', false),
+  (null, '2026-08-15', 'Día de la Madre', true),
+  (null, '2026-08-31', 'Día de la Persona Negra y la Cultura Afrocostarricense', false),
+  (null, '2026-09-15', 'Día de la Independencia', true),
+  (null, '2026-12-01', 'Abolición del Ejército', false),
+  (null, '2026-12-25', 'Navidad', true)
+on conflict do nothing;
+
+insert into negocio.categorias_gasto (nombre, deducible, iva_acreditable) values
+  ('Infraestructura (servidores, dominios)', true, true),
+  ('Comisiones de socios y vendedores', true, true),
+  ('Comisiones de tarjeta', true, false),
+  ('Servicios profesionales (contador, legal)', true, true),
+  ('Mercadeo y publicidad', true, true),
+  ('Software y suscripciones', true, true),
+  ('Equipo de cómputo', true, true),
+  ('Internet y telefonía', true, true),
+  ('Capacitación', true, true),
+  ('Otros', true, true)
+on conflict (nombre) do nothing;
+
+-- Datos del emisor para facturación electrónica. Completar antes de facturar:
+-- la API rechaza emitir comprobantes mientras falte algún dato.
+insert into negocio.configuracion (clave, valor) values
+  ('emisor', '{"nombre": null, "tipo_identificacion": "01", "identificacion": null, "nombre_comercial": "A.U.R.O.M.",
+               "correo": null, "telefono": null, "provincia": null, "canton": null, "distrito": null, "otras_senas": null,
+               "codigo_actividad": null, "sucursal": "001", "terminal": "00001"}'::jsonb),
+  ('cabys_suscripcion', 'null'::jsonb),
+  ('cabys_implementacion', 'null'::jsonb),
+  ('comisiones', '{"implementacion_contador": "50000", "recurrente_contador_pct": "20", "meses_vendedor": 3}'::jsonb),
+  ('tarifa_tarjeta_pct', '"5"'::jsonb)
+on conflict (clave) do nothing;
+
+
+-- >>>>>>>>>>>>>>>>>>>>>>>> 20261009000600_funciones_api.sql
+-- =============================================================================
+-- Planilla Costa Rica · 0006 Funciones de apoyo para la API
+-- =============================================================================
+
+-- Empresas a las que el usuario tiene acceso, con su rol efectivo.
+create or replace function public.mis_empresas()
+returns table (id uuid, nombre text, cedula_juridica text, rol text, estado_servicio text, via text)
+language sql stable security definer set search_path = public as $$
+  select e.id, e.nombre, e.cedula_juridica, ue.rol, e.estado_servicio, 'usuario'
+    from usuarios_empresa ue join empresas e on e.id = ue.empresa_id
+   where ue.usuario_id = auth.uid() and ue.activo
+  union
+  select e.id, e.nombre, e.cedula_juridica,
+         case when bool_or(a.permiso = 'operacion') then 'contador_operacion' else 'contador_lectura' end,
+         e.estado_servicio, 'contador'
+    from asignaciones_contador a join socios s on s.id = a.socio_id join empresas e on e.id = a.empresa_id
+   where s.usuario_id = auth.uid() and a.revocado_en is null and s.estado = 'activo'
+     and not exists (select 1 from usuarios_empresa ue where ue.empresa_id = e.id and ue.usuario_id = auth.uid() and ue.activo)
+   group by e.id
+  order by 2
+$$;
+grant execute on function public.mis_empresas() to authenticated;
+
+-- Usuarios de una empresa con su correo (solo para administradores de la empresa).
+create or replace function public.usuarios_de_empresa(p_empresa uuid)
+returns table (id uuid, usuario_id uuid, correo text, rol text, activo boolean, creado_en timestamptz)
+language plpgsql stable security definer set search_path = public as $$
+begin
+  if not public.es_admin_empresa(p_empresa) then
+    raise exception 'Sin permiso';
+  end if;
+  return query
+    select ue.id, ue.usuario_id, u.email::text, ue.rol, ue.activo, ue.creado_en
+      from usuarios_empresa ue join auth.users u on u.id = ue.usuario_id
+     where ue.empresa_id = p_empresa order by u.email;
+end $$;
+grant execute on function public.usuarios_de_empresa(uuid) to authenticated;
+
+-- Agregar un usuario existente por correo (para administradores de la empresa).
+create or replace function public.agregar_usuario_empresa(p_empresa uuid, p_correo text, p_rol text)
+returns uuid
+language plpgsql security definer set search_path = public as $$
+declare v_usuario uuid; v_id uuid;
+begin
+  if not public.es_admin_empresa(p_empresa) then raise exception 'Sin permiso'; end if;
+  select id into v_usuario from auth.users where lower(email) = lower(trim(p_correo));
+  if v_usuario is null then return null; end if;   -- la API envía invitación
+  insert into usuarios_empresa (empresa_id, usuario_id, rol, creado_por)
+  values (p_empresa, v_usuario, p_rol, auth.uid())
+  on conflict (empresa_id, usuario_id) do update set rol = excluded.rol, activo = true
+  returning id into v_id;
+  return v_id;
+end $$;
+grant execute on function public.agregar_usuario_empresa(uuid, text, text) to authenticated;
+
+-- Buscar un socio activo por código (para asignarlo como contador).
+create or replace function public.socio_por_codigo(p_codigo text)
+returns table (id uuid, nombre text, tipo text, correo text)
+language sql stable security definer set search_path = public as $$
+  select id, nombre, tipo, correo from socios
+   where codigo_referido = upper(trim(p_codigo)) and estado = 'activo'
+$$;
+grant execute on function public.socio_por_codigo(text) to authenticated;
+
+-- Parámetros legales vigentes en una fecha.
+create or replace function public.parametros_vigentes(p_fecha date)
+returns table (vigente_desde date, datos jsonb)
+language sql stable as $$
+  select vigente_desde, datos from public.parametros_legales
+   where vigente_desde <= p_fecha order by vigente_desde desc limit 1
+$$;
+grant execute on function public.parametros_vigentes(date) to authenticated;
+
+-- Correo de un usuario (para mostrar quién aprobó, etc.) solo si comparte empresa.
+create or replace function public.correo_usuario(p_usuario uuid) returns text
+language sql stable security definer set search_path = public as $$
+  select u.email::text from auth.users u
+   where u.id = p_usuario and (
+     p_usuario = auth.uid() or public.es_admin_plataforma()
+     or exists (select 1 from usuarios_empresa a join usuarios_empresa b on a.empresa_id = b.empresa_id
+                where a.usuario_id = auth.uid() and b.usuario_id = p_usuario))
+$$;
+grant execute on function public.correo_usuario(uuid) to authenticated;
+
+-- Fichas de empleado del usuario actual (portal), con el nombre de la empresa.
+-- El empleado no ve la tabla empresas por RLS, por eso es security definer.
+create or replace function public.mis_empleos()
+returns table (id uuid, empresa_id uuid, nombre text, apellidos text, empresa text)
+language sql stable security definer set search_path = public as $$
+  select e.id, e.empresa_id, e.nombre, e.apellidos, em.nombre
+    from empleados e join empresas em on em.id = e.empresa_id
+   where e.usuario_id = auth.uid()
+$$;
+grant execute on function public.mis_empleos() to authenticated;
+
+
+-- >>>>>>>>>>>>>>>>>>>>>>>> 20261009000800_autogestion.sql
+-- =============================================================================
+-- Planilla Costa Rica · 0008 Autogestión: búsqueda de ayuda, portal del empleado,
+-- Telegram, acumulación de vacaciones y funciones de apoyo con permisos
+-- explícitos (Fases 6 y 8).
+-- =============================================================================
+
+-- ------------------------------------------------ Búsqueda en artículos ----
+-- Normaliza tildes para que "liquidacion" y "liquidación" coincidan.
+create or replace function public.sin_tildes(p text) returns text
+language sql immutable parallel safe as $$
+  select translate(lower(coalesce(p, '')), 'áéíóúüñàèìòù', 'aeiouunaeiou')
+$$;
+
+create or replace function public.articulo_tsv(p_titulo text, p_contenido text, p_palabras text[]) returns tsvector
+language sql immutable parallel safe as $$
+  select setweight(to_tsvector('spanish'::regconfig, public.sin_tildes(p_titulo)), 'A')
+      || setweight(to_tsvector('spanish'::regconfig, public.sin_tildes(array_to_string(p_palabras, ' '))), 'B')
+      || setweight(to_tsvector('spanish'::regconfig, public.sin_tildes(p_contenido)), 'C')
+$$;
+
+alter table public.articulos_ayuda
+  add column if not exists busqueda tsvector
+  generated always as (public.articulo_tsv(titulo, contenido, palabras_clave)) stored;
+create index if not exists articulos_ayuda_busqueda on public.articulos_ayuda using gin (busqueda);
+
+-- Búsqueda con ranking. Corre con los permisos de quien llama (RLS: solo publicados,
+-- salvo la plataforma). Usa OR entre palabras para preguntas en lenguaje natural.
+create or replace function public.buscar_ayuda(p_q text, p_limite int default 5)
+returns table (id uuid, titulo text, categoria text, contenido text, rango real, fragmento text)
+language sql stable security invoker set search_path = public as $$
+  with q as (
+    select nullif(replace(plainto_tsquery('spanish'::regconfig, public.sin_tildes(p_q))::text, ' & ', ' | '), '') as txt
+  ), tq as (select to_tsquery('spanish'::regconfig, txt) as consulta from q where txt is not null)
+  select a.id, a.titulo, a.categoria, a.contenido,
+         ts_rank_cd(a.busqueda, tq.consulta, 1)::real as rango,
+         ts_headline('spanish'::regconfig, a.contenido, tq.consulta,
+                     'MaxWords=45, MinWords=15, MaxFragments=2, FragmentDelimiter=" … ", StartSel="", StopSel=""') as fragmento
+    from articulos_ayuda a, tq
+   where a.busqueda @@ tq.consulta
+   order by rango desc, a.actualizado_en desc
+   limit greatest(1, least(coalesce(p_limite, 5), 20))
+$$;
+grant execute on function public.buscar_ayuda(text, int) to authenticated;
+
+-- ------------------------------------------------ Portal del empleado -------
+-- La política original de boletas consultaba planillas con el RLS del empleado,
+-- que no ve planillas: nunca devolvía filas. Se reemplaza por una función que
+-- solo responde si la planilla está cerrada.
+create or replace function public.planilla_cerrada(p_planilla uuid) returns boolean
+language sql stable security definer set search_path = public as $$
+  select exists (select 1 from planillas where id = p_planilla and estado = 'cerrada')
+$$;
+
+drop policy if exists empleado_ve_sus_boletas on public.boletas;
+create policy empleado_ve_sus_boletas on public.boletas for select to authenticated using (
+  exists (select 1 from public.empleados e where e.id = empleado_id and e.usuario_id = auth.uid())
+  and public.planilla_cerrada(planilla_id));
+
+-- Datos mínimos de las planillas cerradas donde el usuario tiene boleta (el empleado
+-- no ve la tabla planillas ni la empresa: solo periodo, fecha de pago y encabezado).
+create or replace function public.portal_planillas()
+returns table (planilla_id uuid, empresa_id uuid, empresa_nombre text, cedula_juridica text, tipo text,
+               desde date, hasta date, fecha_pago date, nota_boleta text)
+language sql stable security definer set search_path = public as $$
+  select distinct p.id, p.empresa_id, em.nombre, em.cedula_juridica, p.tipo, p.desde, p.hasta, p.fecha_pago, c.nota_boleta
+    from boletas b
+    join empleados e on e.id = b.empleado_id and e.usuario_id = auth.uid()
+    join planillas p on p.id = b.planilla_id and p.estado = 'cerrada'
+    join empresas em on em.id = p.empresa_id
+    left join configuracion_planilla c on c.empresa_id = p.empresa_id
+   where auth.uid() is not null
+$$;
+grant execute on function public.portal_planillas() to authenticated;
+
+-- Nombre de la empresa de cada ficha del empleado (para el perfil del portal).
+create or replace function public.portal_empleos()
+returns table (empleado_id uuid, empresa_id uuid, empresa_nombre text)
+language sql stable security definer set search_path = public as $$
+  select e.id, e.empresa_id, em.nombre from empleados e join empresas em on em.id = e.empresa_id
+   where e.usuario_id = auth.uid() and auth.uid() is not null
+   order by em.nombre
+$$;
+grant execute on function public.portal_empleos() to authenticated;
+
+-- Buscar una cuenta por correo: solo la plataforma o un administrador de la empresa indicada.
+create or replace function public.buscar_usuario_por_correo(p_correo text, p_empresa uuid default null)
+returns uuid
+language plpgsql stable security definer set search_path = public as $$
+begin
+  if not (public.es_admin_plataforma() or (p_empresa is not null and public.es_admin_empresa(p_empresa))) then
+    raise exception 'Sin permiso para buscar usuarios';
+  end if;
+  return (select id from auth.users where lower(email) = lower(trim(p_correo)) limit 1);
+end $$;
+grant execute on function public.buscar_usuario_por_correo(text, uuid) to authenticated;
+
+-- ------------------------------------------- Acumulación de vacaciones ------
+-- Bitácora de los días acreditados por la tarea diaria (Art. 153 CT). La
+-- unicidad por empleado y fecha hace la tarea idempotente.
+create table if not exists public.vacaciones_acumuladas (
+  id uuid primary key default gen_random_uuid(),
+  empresa_id uuid not null references public.empresas(id) on delete cascade,
+  empleado_id uuid not null references public.empleados(id) on delete cascade,
+  fecha date not null,
+  dias numeric(6,2) not null,
+  saldo_resultante numeric(8,2) not null,
+  detalle text,
+  creado_en timestamptz not null default now(),
+  unique (empleado_id, fecha)
+);
+alter table public.vacaciones_acumuladas enable row level security;
+drop policy if exists ver on public.vacaciones_acumuladas;
+create policy ver on public.vacaciones_acumuladas for select to authenticated using (
+  public.puede_ver(empresa_id)
+  or exists (select 1 from public.empleados e where e.id = empleado_id and e.usuario_id = auth.uid()));
+grant select on public.vacaciones_acumuladas to authenticated;
+
+-- ---------------------------------------------------- Telegram ------------
+-- Idempotencia del webhook: un update_id de Telegram se procesa una sola vez.
+create unique index if not exists eventos_telegram_update
+  on negocio.eventos_webhook ((contenido ->> 'update_id')) where origen = 'telegram';
+
+-- Chat de Telegram de un usuario de la empresa (para avisarle respuestas de soporte).
+-- Vive en el esquema negocio (no expuesto por la API REST de Supabase).
+create or replace function negocio.chat_usuario_empresa(p_empresa uuid, p_usuario uuid) returns text
+language sql stable security definer set search_path = public as $$
+  select v.chat_id from telegram_vinculos v
+   where v.usuario_id = p_usuario and v.activo and v.chat_id is not null
+     and public.puede_ver(p_empresa)
+     and exists (select 1 from usuarios_empresa ue where ue.empresa_id = p_empresa and ue.usuario_id = p_usuario and ue.activo)
+   order by v.creado_en desc limit 1
+$$;
+grant execute on function negocio.chat_usuario_empresa(uuid, uuid) to authenticated;
+
+-- Alerta para la dueña cuando un ticket se escala o es urgente. Quien llama
+-- debe tener acceso a la empresa del ticket y el ticket debe ameritarlo.
+create or replace function negocio.alerta_soporte(p_ticket uuid, p_mensaje text, p_severidad text default 'aviso',
+                                                  p_enviada boolean default false) returns uuid
+language plpgsql security definer set search_path = public as $$
+declare v_id uuid; v_t record;
+begin
+  select empresa_id, nivel, prioridad into v_t from tickets where id = p_ticket;
+  if v_t is null or not public.puede_ver(v_t.empresa_id) then raise exception 'Sin permiso'; end if;
+  if not (v_t.nivel = 'plataforma' or v_t.prioridad = 'urgente') then
+    raise exception 'El ticket no requiere alerta a la plataforma';
+  end if;
+  insert into negocio.alertas (tipo, severidad, mensaje, enviada_en)
+  values ('ticket', case when p_severidad in ('info','aviso','critica') then p_severidad else 'aviso' end,
+          left(p_mensaje, 2000), case when p_enviada then now() end)
+  returning id into v_id;
+  return v_id;
+end $$;
+grant execute on function negocio.alerta_soporte(uuid, text, text, boolean) to authenticated;
+
+-- ------------------------------------------------------ Prospectos --------
+-- ¿Otro socio ya tiene ese prospecto con atribución vigente? Solo devuelve la
+-- fecha de vencimiento (no quién lo tiene). Solo para socios activos.
+create or replace function public.prospecto_ocupado(p_nombre text) returns date
+language plpgsql stable security definer set search_path = public as $$
+begin
+  if public.mi_socio_id() is null and not public.es_admin_plataforma() then raise exception 'Solo socios'; end if;
+  return (select max(vence_atribucion) from prospectos
+           where public.sin_tildes(trim(empresa_nombre)) = public.sin_tildes(trim(p_nombre))
+             and estado = 'abierto' and vence_atribucion >= current_date
+             and socio_id is distinct from public.mi_socio_id());
+end $$;
+grant execute on function public.prospecto_ocupado(text) to authenticated;
+
+-- ------------------------------------------------ Artículos de ayuda -------
+insert into public.articulos_ayuda (titulo, categoria, palabras_clave, contenido)
+select v.titulo, v.categoria, v.palabras, v.contenido
+  from (values
+  ('Cómo crear una planilla', 'planillas', array['planilla','nueva','crear','quincena','periodo','calcular'],
+   'Vaya a Planillas y pulse «Nueva planilla». Elija el periodo (desde y hasta), el calendario de pago o la frecuencia (mensual, quincenal o semanal), la sucursal si aplica y la fecha de pago. La planilla queda en borrador. Antes de calcular registre las novedades del periodo: horas extra aprobadas, incapacidades, permisos, vacaciones, bonos y rebajos. Luego pulse «Calcular»: el sistema genera una boleta por cada empleado activo con CCSS, impuesto al salario, embargos, pensiones y préstamos. Puede recalcular cuantas veces necesite mientras la planilla no esté aprobada.'),
+  ('Cómo aprobar y cerrar una planilla', 'planillas', array['aprobar','cerrar','reabrir','aprobador','devolver'],
+   'Una planilla calculada la revisa un usuario con rol aprobador o administrador. En el detalle de la planilla revise totales y advertencias y pulse «Aprobar». Si encuentra un error use «Devolver» para que el operador la corrija y recalcule. Después del pago pulse «Cerrar»: se descuentan las cuotas de préstamos, se marcan las horas extra como pagadas, se rebaja el saldo de vacaciones y se genera el asiento contable. Si necesita corregir una planilla cerrada, un aprobador puede «Reabrir» indicando el motivo; queda registrado en la bitácora.'),
+  ('Cómo enviar las boletas de pago por correo', 'boletas', array['boleta','boletas','enviar','correo','pdf','comprobante','colilla'],
+   'Las boletas se envían cuando la planilla está aprobada o cerrada. En el detalle de la planilla pulse «Enviar boletas»: cada empleado recibe su boleta en PDF al correo registrado en su ficha. Los empleados sin correo aparecen como omitidos; complete el correo en la ficha y vuelva a enviar solo esas boletas. También puede descargar cada boleta en PDF o invitar al empleado al portal para que consulte sus boletas en línea.'),
+  ('Cómo registrar una incapacidad', 'novedades', array['incapacidad','incapacidades','ccss','ins','maternidad','subsidio','boleta medica'],
+   'En Novedades > Incapacidades pulse «Nueva». Elija el empleado, el tipo (CCSS por enfermedad, INS por riesgo del trabajo o licencia de maternidad), las fechas y el número de boleta. Para CCSS el patrono paga los primeros 3 días al 50 % y a partir del cuarto día subsidia la Caja según el porcentaje del certificado (60 % por defecto); marque «prórroga» si continúa una incapacidad anterior para no volver a cobrar los días del patrono. Las incapacidades del INS no se pagan en planilla porque el subsidio lo paga directamente el INS.'),
+  ('Vacaciones: saldo, solicitudes y pago', 'vacaciones', array['vacaciones','saldo','dias','solicitud','disfrute','acumulacion'],
+   'Cada empleado acumula vacaciones según el Art. 153 del Código de Trabajo (12 días hábiles por cada 50 semanas): el sistema acredita un día por cada mes cumplido desde la fecha de ingreso. Registre las vacaciones en Novedades > Vacaciones como disfrute (con fechas) o pago en dinero; un aprobador las autoriza y al cerrar la planilla se rebajan del saldo. Los empleados con acceso al portal pueden solicitar vacaciones desde su teléfono. El sistema avisa cuando hay saldos negativos o vacaciones cerca de prescribir.'),
+  ('Cómo calcular el aguinaldo', 'aguinaldo', array['aguinaldo','decimotercer','diciembre','bono navideño'],
+   'En Aguinaldo elija el año y pulse «Calcular». El sistema suma los salarios brutos de diciembre del año anterior a noviembre del año actual y divide entre doce. Revise el detalle por empleado; si lo desea cree la planilla de aguinaldo para aprobarla, cerrarla y enviar las boletas. El aguinaldo no lleva cargas de la CCSS ni impuesto al salario y debe pagarse dentro de los primeros veinte días de diciembre.'),
+  ('Cómo hacer una liquidación laboral', 'liquidaciones', array['liquidacion','despido','renuncia','preaviso','cesantia','finiquito','prestaciones'],
+   'En Liquidaciones pulse «Simular». Elija el empleado, la fecha de salida y el motivo (renuncia, despido con o sin responsabilidad patronal, mutuo acuerdo, pensión, fallecimiento o fin de contrato). El sistema calcula el salario promedio de los últimos seis meses, preaviso, cesantía, vacaciones pendientes y aguinaldo proporcional, y puede rebajar el saldo de préstamos. Si el resultado es correcto, guárdela y un aprobador la aprueba. Puede descargar el PDF de la liquidación y la constancia para el empleado.'),
+  ('Cómo agregar usuarios a la empresa', 'usuarios', array['usuario','usuarios','invitar','rol','permiso','acceso','operador','aprobador'],
+   'Solo un administrador de la empresa puede agregar usuarios. Vaya a Configuración > Usuarios y pulse «Agregar». Escriba el correo y elija el rol: administrador (todo), aprobador (aprueba planillas, cambios salariales y vacaciones), operador (registra datos y calcula) o lectura (solo consulta). Si la persona aún no tiene cuenta recibirá una invitación por correo. Puede cambiar el rol o desactivar el acceso en cualquier momento.'),
+  ('Cómo asignar un contador a la empresa', 'contadores', array['contador','asignar','soporte','socio','codigo','supervision'],
+   'Su contador puede supervisar las planillas y darle soporte de primer nivel. En Configuración > Contadores pulse «Asignar» y escriba el código de socio que le dio su contador. Elija sus funciones (supervisión, soporte) y el permiso: lectura (solo consulta) u operación (puede registrar y calcular, pero no aprobar). Los tickets de soporte llegan primero a su contador y, si él no puede resolverlos, los escala a A.U.R.O.M. Puede revocar el acceso cuando quiera.'),
+  ('Cómo registrar o cambiar la tarjeta de pago', 'facturacion', array['tarjeta','pago','suscripcion','cobro','tilopay','factura','plan'],
+   'En Configuración > Suscripción pulse «Registrar tarjeta». Se abre la página segura de Tilopay donde ingresa los datos de la tarjeta; Planilla Costa Rica nunca ve ni guarda el número completo. El cobro mensual se hace automáticamente según la cantidad de empleados activos y recibirá la factura electrónica por correo. Si un cobro es rechazado tendrá unos días de gracia para actualizar la tarjeta antes de que la cuenta pase a solo lectura.'),
+  ('Portal del empleado', 'portal', array['portal','empleado','acceso','boletas','consultar','invitar'],
+   'El administrador puede invitar a cada empleado al portal desde su ficha con «Invitar al portal»; el empleado recibe un correo para crear su contraseña. En el portal el empleado ve su ficha, descarga sus boletas de planillas cerradas, consulta su saldo de vacaciones y envía solicitudes de vacaciones para que las apruebe la empresa.'),
+  ('Avisos por Telegram', 'telegram', array['telegram','avisos','notificaciones','bot','vincular','recordatorios'],
+   'En su perfil pulse «Vincular Telegram» y abra el enlace: el bot de Planilla Costa Rica quedará conectado a su cuenta. Recibirá avisos de boletas disponibles y recordatorios de fechas (SICERE de la CCSS, planilla del INS, aguinaldo). En el bot puede escribir /ayuda seguido de su pregunta, /ticket para abrir una solicitud de soporte y /estado para ver la última planilla de sus empresas.')
+  ) as v(titulo, categoria, palabras, contenido)
+ where not exists (select 1 from public.articulos_ayuda a where a.titulo = v.titulo);
+
+
+-- >>>>>>>>>>>>>>>>>>>>>>>> 20261009000900_negocio.sql
+-- =============================================================================
+-- Planilla Costa Rica · 0009 Negocio: consecutivos de comprobantes, columnas para
+-- cobros/comisiones, sincronía de estado del servicio y configuración extra.
+-- (Fase 7 y cobros de la Fase 8). Se aplica después de 0004/0005.
+-- =============================================================================
+
+-- ------------------------------------------------ Consecutivos por tipo ----
+-- Hacienda exige numeración consecutiva por sucursal, terminal y tipo de
+-- comprobante. Se usa una tabla (no una secuencia) para que no queden huecos:
+-- el número se toma dentro de la misma transacción que firma el comprobante.
+create table if not exists negocio.consecutivos (
+  sucursal char(3) not null,
+  terminal char(5) not null,
+  tipo char(2) not null,
+  ultimo bigint not null default 0 check (ultimo >= 0 and ultimo < 10000000000),
+  primary key (sucursal, terminal, tipo)
+);
+
+create or replace function negocio.siguiente_consecutivo(p_sucursal text, p_terminal text, p_tipo text)
+returns bigint language sql as $$
+  insert into negocio.consecutivos (sucursal, terminal, tipo, ultimo)
+  values (p_sucursal, p_terminal, p_tipo, 1)
+  on conflict (sucursal, terminal, tipo) do update set ultimo = negocio.consecutivos.ultimo + 1
+  returning ultimo
+$$;
+grant execute on function negocio.siguiente_consecutivo(text, text, text) to authenticated;
+
+-- ---------------------------------------------------- Columnas nuevas ------
+alter table negocio.clientes
+  add column if not exists gracia_desde date,          -- primer día sin pago (vencimiento más antiguo)
+  add column if not exists notas text;
+
+alter table negocio.comprobantes
+  add column if not exists concepto text not null default 'suscripcion'
+    check (concepto in ('suscripcion','implementacion','otro')),
+  add column if not exists situacion char(1) not null default '1',   -- 1 normal, 2 contingencia, 3 sin internet
+  add column if not exists codigo_seguridad char(8),
+  add column if not exists empleados_facturados int,
+  add column if not exists xml_respuesta text,                        -- MensajeHacienda (decodificado)
+  add column if not exists enviado_hacienda_en timestamptz,
+  add column if not exists intentos_envio int not null default 0;
+create unique index if not exists comprobante_suscripcion_unica
+  on negocio.comprobantes (cliente_id, periodo)
+  where tipo in ('01','04') and concepto = 'suscripcion' and estado <> 'anulado';
+create index if not exists comprobantes_estado on negocio.comprobantes (estado, fecha);
+
+alter table negocio.comprobante_lineas
+  add column if not exists codigo_tarifa_iva char(2) not null default '08';  -- 08 = tarifa general 13 %
+
+alter table negocio.pagos
+  add column if not exists concepto text not null default 'mensualidad'
+    check (concepto in ('mensualidad','implementacion','otro')),
+  add column if not exists periodo date,                -- mes que paga (primer día) si es mensualidad
+  add column if not exists subtotal numeric(14,2),      -- monto sin IVA (base de comisiones)
+  add column if not exists moneda text not null default 'CRC',
+  add column if not exists tipo_cambio numeric(12,5) not null default 1,
+  add column if not exists cobro_id uuid references negocio.cobros(id);
+create unique index if not exists pago_referencia_unica on negocio.pagos (medio, referencia) where referencia is not null;
+create index if not exists pagos_cliente on negocio.pagos (cliente_id, periodo);
+
+alter table negocio.cobros
+  add column if not exists moneda text not null default 'CRC',
+  add column if not exists descripcion text,
+  add column if not exists metodo_pago_id uuid references negocio.metodos_pago(id);
+create index if not exists cobros_cliente on negocio.cobros (cliente_id, periodo);
+
+alter table negocio.metodos_pago
+  add column if not exists marca text,
+  add column if not exists correo text;                 -- correo asociado al token en Tilopay
+create unique index if not exists metodo_pago_activo_unico on negocio.metodos_pago (cliente_id) where estado = 'activo';
+
+alter table negocio.gastos
+  add column if not exists consecutivo_comprobante char(20),
+  add column if not exists comprobante_tipo char(2);
+create unique index if not exists gasto_clave_unica on negocio.gastos (clave_comprobante) where clave_comprobante is not null;
+create index if not exists gastos_fecha on negocio.gastos (fecha);
+
+alter table public.comisiones add column if not exists pago_id uuid;
+create index if not exists comisiones_periodo on public.comisiones (periodo, socio_id);
+
+-- RLS para las tablas nuevas del esquema negocio (solo la dueña).
+alter table negocio.consecutivos enable row level security;
+drop policy if exists solo_plataforma on negocio.consecutivos;
+create policy solo_plataforma on negocio.consecutivos for all to authenticated
+  using (public.es_admin_plataforma()) with check (public.es_admin_plataforma());
+grant select, insert, update, delete on negocio.consecutivos to authenticated;
+grant all on negocio.consecutivos to service_role;
+
+-- ------------------------------ Estado del servicio sincronizado ----------
+-- negocio.clientes.estado manda; public.empresas.estado_servicio lo refleja.
+create or replace function negocio.tg_cliente_estado() returns trigger
+language plpgsql security definer set search_path = public, negocio as $$
+begin
+  if new.empresa_id is not null and (tg_op = 'INSERT' or new.estado is distinct from old.estado
+                                     or new.empresa_id is distinct from old.empresa_id) then
+    update public.empresas set estado_servicio = new.estado
+     where id = new.empresa_id and estado_servicio is distinct from new.estado;
+  end if;
+  return new;
+end $$;
+drop trigger if exists cliente_estado on negocio.clientes;
+create trigger cliente_estado after insert or update of estado, empresa_id on negocio.clientes
+  for each row execute function negocio.tg_cliente_estado();
+
+-- ------------------------------------ Vista del cliente (autogestión) -----
+-- El administrador de una empresa no puede leer negocio.metodos_pago (tiene el
+-- token del proveedor). Esta función le muestra solo lo seguro.
+create or replace function negocio.metodo_pago_empresa(p_empresa uuid)
+returns table (id uuid, proveedor text, marca text, ultimos4 text, vence text, estado text, creado_en timestamptz)
+language sql stable security definer set search_path = public, negocio as $$
+  select m.id, m.proveedor, m.marca, m.ultimos4::text, m.vence, m.estado, m.creado_en
+    from negocio.metodos_pago m join negocio.clientes c on c.id = m.cliente_id
+   where c.empresa_id = p_empresa and m.estado = 'activo' and public.es_admin_empresa(p_empresa)
+   order by m.creado_en desc limit 1
+$$;
+grant execute on function negocio.metodo_pago_empresa(uuid) to authenticated;
+
+-- Alta de la ficha de facturación desde la autogestión (admin de la empresa).
+-- Usa los datos de la empresa; no toca precios (quedan los de la tabla).
+create or replace function negocio.alta_cliente_empresa(p_empresa uuid, p_correo text)
+returns uuid language plpgsql security definer set search_path = public, negocio as $$
+declare
+  v_id uuid;
+  v_emp record;
+  v_ced text;
+begin
+  if not public.es_admin_empresa(p_empresa) then raise exception 'Sin permiso'; end if;
+  select id into v_id from negocio.clientes where empresa_id = p_empresa;
+  if v_id is not null then return v_id; end if;
+  select * into v_emp from public.empresas where id = p_empresa;
+  v_ced := regexp_replace(coalesce(v_emp.cedula_juridica, ''), '\D', '', 'g');
+  if v_ced = '' then raise exception 'La empresa no tiene cédula registrada'; end if;
+  insert into negocio.clientes (empresa_id, razon_social, tipo_identificacion, identificacion, correo_facturacion,
+                                telefono, estado)
+  values (p_empresa, v_emp.nombre,
+          case when length(v_ced) = 10 and left(v_ced, 1) = '3' then '02'
+               when length(v_ced) = 9 then '01'
+               when length(v_ced) in (11, 12) then '03'
+               else '02' end,
+          v_ced, coalesce(nullif(v_emp.correo, ''), p_correo), v_emp.telefono,
+          case when v_emp.estado_servicio in ('prueba','activo','gracia','solo_lectura','suspendido')
+               then v_emp.estado_servicio else 'activo' end)
+  returning id into v_id;
+  return v_id;
+end $$;
+grant execute on function negocio.alta_cliente_empresa(uuid, text) to authenticated;
+
+-- ------------------------------------------------ Configuración extra -----
+insert into negocio.configuracion (clave, valor) values
+  -- Precios de lista (cada cliente guarda los suyos en negocio.clientes).
+  ('precios', '{"mensual": "55000", "empleados_incluidos": 50, "bloque_10": "11000", "implementacion": "100000",
+                "fundador_usd": "100", "iva_pct": "13"}'::jsonb),
+  -- Política de cobro: gracia 7 días con reintentos los días 1, 3 y 5; solo lectura; suspensión a los 30 días.
+  ('cobro', '{"dias_gracia": 7, "reintentos": [1, 3, 5], "dias_suspension": 30}'::jsonb),
+  -- Tipo de cambio de referencia del BCCR para comprobantes en dólares (actualizar antes de facturar en USD).
+  ('tipo_cambio_usd', '{"valor": null, "fecha": null, "fuente": "BCCR tipo de cambio de referencia (venta)"}'::jsonb),
+  -- Política de firma XAdES-EPES. Si digest es null se descarga el documento y se calcula su SHA-256.
+  ('firma_politica', '{"url": "https://cdn.comprobanteselectronicos.go.cr/xml-schemas/Resoluci%C3%B3n_General_sobre_disposiciones_t%C3%A9cnicas_comprobantes_electr%C3%B3nicos_para_efectos_tributarios.pdf",
+                       "digest": null, "algoritmo": "sha256"}'::jsonb),
+  -- Cédula del proveedor de sistemas (A.U.R.O.M. inscrita en el RUT). Si es null se usa la del emisor.
+  ('proveedor_sistemas', 'null'::jsonb),
+  -- Reparto de la utilidad mensual. Tramos por utilidad del mes (colones); ajustar con la dueña.
+  ('reparto', '{"tramos": [{"hasta": "1000000", "pct_salario": "50"}, {"hasta": "3000000", "pct_salario": "60"},
+                           {"hasta": "6000000", "pct_salario": "70"}, {"hasta": null, "pct_salario": "75"}],
+                "tope_salario_neto": "4000000", "pct_caja_del_resto": "50", "pct_inversion_del_resto": "50"}'::jsonb),
+  -- Renta y CCSS de la dueña como trabajadora independiente: se deben confirmar con el contador.
+  ('renta', '{"tipo_contribuyente": "persona_fisica_actividad_lucrativa", "tramos": null,
+              "ccss_independiente_pct": null, "nota": "Tramos y porcentaje CCSS pendientes de confirmar con el contador"}'::jsonb)
+on conflict (clave) do nothing;
+
+
+-- >>>>>>>>>>>>>>>>>>>>>>>> 20261009001000_endurecimiento.sql
+-- =============================================================================
+-- Planilla Costa Rica · 0010 Endurecimiento (revisión independiente de seguridad)
+--
+-- Supabase expone el esquema public por su Data API (PostgREST). Este sistema
+-- NO usa esa vía para escribir: todo cambio pasa por la API (FastAPI), que marca
+-- su transacción con aurom.via_api = 'si'. Desde PostgREST un usuario no puede
+-- fijar esa marca (set_config no está expuesto), así que cualquier escritura de
+-- un usuario autenticado que no venga de la API se rechaza. Además se recomienda
+-- desactivar la Data API o quitar public/negocio de los esquemas expuestos.
+-- =============================================================================
+
+create or replace function public.via_api() returns boolean
+language sql stable as $$ select coalesce(current_setting('aurom.via_api', true), '') = 'si' $$;
+
+create or replace function public.tg_solo_api() returns trigger
+language plpgsql as $$
+begin
+  if current_user = 'authenticated' and not public.via_api() then
+    raise exception 'Las modificaciones se hacen desde la aplicación Planilla Costa Rica';
+  end if;
+  return coalesce(new, old);
+end $$;
+
+-- Aplica la regla a todas las tablas de public y negocio.
+do $$
+declare t record;
+begin
+  for t in select schemaname, tablename from pg_tables
+            where schemaname in ('public','negocio') and tablename not in ('auditoria')
+  loop
+    execute format('drop trigger if exists solo_api on %I.%I', t.schemaname, t.tablename);
+    execute format('create trigger solo_api before insert or update or delete on %I.%I '
+                   'for each row execute function public.tg_solo_api()', t.schemaname, t.tablename);
+  end loop;
+end $$;
+
+-- ------------------------------------------------ Empresas: columnas protegidas
+create or replace function public.tg_empresa_campos() returns trigger
+language plpgsql as $$
+begin
+  if current_user = 'authenticated' and not public.es_admin_plataforma()
+     and (new.estado_servicio, new.plan, new.referido_por, new.creado_por)
+         is distinct from (old.estado_servicio, old.plan, old.referido_por, old.creado_por) then
+    raise exception 'Solo la plataforma cambia el estado del servicio, el plan o el referido';
+  end if;
+  return new;
+end $$;
+create trigger empresa_campos before update on public.empresas
+  for each row execute function public.tg_empresa_campos();
+
+-- ------------------------------------------- Aprobaciones en la base de datos
+-- Cambios salariales: siempre nacen pendientes.
+create or replace function public.tg_historial_nuevo() returns trigger
+language plpgsql as $$
+begin
+  -- Un aprobador puede registrar historial ya autorizado (p. ej. migración desde Odoo).
+  if current_user = 'authenticated' and not public.puede_aprobar(new.empresa_id) then
+    new.estado := 'pendiente'; new.autorizado_por := null; new.autorizado_en := null;
+  end if;
+  return new;
+end $$;
+create trigger historial_nuevo before insert on public.historial_salarial
+  for each row execute function public.tg_historial_nuevo();
+
+-- El salario de la ficha solo lo cambia un aprobador (vía historial autorizado).
+create or replace function public.tg_empleado_salario() returns trigger
+language plpgsql as $$
+begin
+  if current_user = 'authenticated' and new.salario_mensual is distinct from old.salario_mensual
+     and not public.puede_aprobar(new.empresa_id) then
+    raise exception 'El salario se cambia con una solicitud de cambio salarial autorizada';
+  end if;
+  if new.empresa_id is distinct from old.empresa_id then
+    raise exception 'Un empleado no se puede mover de empresa';
+  end if;
+  return new;
+end $$;
+create trigger empleado_salario before update on public.empleados
+  for each row execute function public.tg_empleado_salario();
+
+-- Planillas: nacen en borrador; salir de aprobada exige aprobador.
+create or replace function public.tg_planilla_nueva() returns trigger
+language plpgsql as $$
+begin
+  if current_user = 'authenticated' then
+    new.estado := 'borrador'; new.aprobada_por := null; new.aprobada_en := null;
+    new.cerrada_por := null; new.cerrada_en := null;
+  end if;
+  return new;
+end $$;
+create trigger planilla_nueva before insert on public.planillas
+  for each row execute function public.tg_planilla_nueva();
+
+create or replace function public.tg_planilla_salir_aprobada() returns trigger
+language plpgsql as $$
+begin
+  if current_user = 'authenticated' and old.estado = 'aprobada' and new.estado is distinct from old.estado
+     and not public.puede_aprobar(new.empresa_id) then
+    raise exception 'Solo un aprobador puede devolver o cerrar una planilla aprobada';
+  end if;
+  if new.empresa_id is distinct from old.empresa_id then
+    raise exception 'Una planilla no se puede mover de empresa';
+  end if;
+  return new;
+end $$;
+create trigger planilla_salir_aprobada before update on public.planillas
+  for each row execute function public.tg_planilla_salir_aprobada();
+
+-- Boletas y líneas: revisar la planilla vieja y la nueva; no se mueven.
+create or replace function public.tg_boleta_inmutable() returns trigger
+language plpgsql as $$
+declare
+  v_new jsonb := case when tg_op <> 'DELETE' then to_jsonb(new) end;
+  v_old jsonb := case when tg_op <> 'INSERT' then to_jsonb(old) end;
+  v_campos text[] := case when tg_table_name = 'boletas' then array['planilla_id','empresa_id','empleado_id']
+                          else array['boleta_id','empresa_id'] end;
+  v_c text;
+  v_estado text;
+  v_planillas uuid[];
+begin
+  if tg_op = 'UPDATE' then
+    foreach v_c in array v_campos loop
+      if v_new ->> v_c is distinct from v_old ->> v_c then
+        raise exception 'Una boleta o línea no se puede mover de planilla, boleta, empresa o empleado';
+      end if;
+    end loop;
+  end if;
+  if tg_table_name = 'boletas' then
+    v_planillas := array[coalesce(v_new, v_old) ->> 'planilla_id']::uuid[];
+  else
+    select array_agg(b.planilla_id) into v_planillas from public.boletas b
+     where b.id = (coalesce(v_new, v_old) ->> 'boleta_id')::uuid;
+  end if;
+  select min(estado) into v_estado from public.planillas
+   where id = any(v_planillas) and estado in ('aprobada','cerrada');
+  if v_estado is not null then
+    raise exception 'La planilla está %: las boletas no se pueden modificar', v_estado;
+  end if;
+  return coalesce(new, old);
+end $$;
+
+-- ------------------------------------- Empleados de otra empresa (FK compuesta)
+alter table public.empleados add constraint empleados_empresa_id_unico unique (empresa_id, id);
+do $$
+declare t text;
+begin
+  foreach t in array array['historial_salarial','documentos_empleado','movimientos_empleado','marcas_asistencia',
+    'horas_extra','incapacidades','permisos','vacaciones','bonos','otras_deducciones','rebajos_renta','prestamos',
+    'embargos','pensiones_alimentarias','boletas','aguinaldos','liquidaciones']
+  loop
+    execute format('alter table public.%I add constraint %I foreign key (empresa_id, empleado_id) '
+                   'references public.empleados (empresa_id, id) on delete cascade', t, t || '_empleado_misma_empresa');
+  end loop;
+end $$;
+alter table public.boletas drop constraint boletas_empleado_misma_empresa;
+alter table public.boletas add constraint boletas_empleado_misma_empresa foreign key (empresa_id, empleado_id)
+  references public.empleados (empresa_id, id) on delete restrict;
+alter table public.aguinaldos drop constraint aguinaldos_empleado_misma_empresa;
+alter table public.aguinaldos add constraint aguinaldos_empleado_misma_empresa foreign key (empresa_id, empleado_id)
+  references public.empleados (empresa_id, id) on delete restrict;
+alter table public.liquidaciones drop constraint liquidaciones_empleado_misma_empresa;
+alter table public.liquidaciones add constraint liquidaciones_empleado_misma_empresa foreign key (empresa_id, empleado_id)
+  references public.empleados (empresa_id, id) on delete restrict;
+
+-- La planilla de una boleta y el préstamo de un pago deben ser de la misma empresa.
+alter table public.planillas add constraint planillas_empresa_id_unico unique (empresa_id, id);
+alter table public.boletas add constraint boletas_planilla_misma_empresa foreign key (empresa_id, planilla_id)
+  references public.planillas (empresa_id, id) on delete cascade;
+alter table public.prestamos add constraint prestamos_empresa_id_unico unique (empresa_id, id);
+alter table public.prestamo_pagos add constraint pagos_prestamo_misma_empresa foreign key (empresa_id, prestamo_id)
+  references public.prestamos (empresa_id, id) on delete cascade;
+
+-- ------------------------------------------------------------ Portal y socios
+drop policy if exists empleado_solicita_vacaciones on public.vacaciones;
+create policy empleado_solicita_vacaciones on public.vacaciones for insert to authenticated
+  with check (estado = 'solicitada' and tipo = 'disfrute' and monto is null and boleta_id is null and exists (
+    select 1 from public.empleados e where e.id = empleado_id and e.empresa_id = vacaciones.empresa_id
+      and e.usuario_id = auth.uid()));
+
+create or replace function public.tg_prospecto_campos() returns trigger
+language plpgsql as $$
+begin
+  if current_user = 'authenticated' and not public.es_admin_plataforma() then
+    if tg_op = 'INSERT' then
+      new.vence_atribucion := current_date + 90; new.estado := 'abierto'; new.empresa_id := null;
+      new.registrado_en := now();
+    end if;
+  end if;
+  return new;
+end $$;
+create trigger prospecto_campos before insert on public.prospectos
+  for each row execute function public.tg_prospecto_campos();
+
+-- Telegram: códigos largos; el vínculo (chat, activo, rol) solo lo cambia el sistema.
+alter table public.telegram_vinculos alter column codigo_vinculacion
+  set default upper(substr(replace(gen_random_uuid()::text, '-', ''), 1, 16));
+create or replace function public.tg_telegram_campos() returns trigger
+language plpgsql as $$
+begin
+  if current_user = 'authenticated' and not public.es_admin_plataforma() then
+    if tg_op = 'INSERT' then
+      new.chat_id := null; new.activo := false; new.creado_en := now();
+      new.codigo_vinculacion := upper(substr(replace(gen_random_uuid()::text, '-', ''), 1, 16));
+    elsif (new.chat_id, new.activo, new.rol, new.creado_en, new.codigo_vinculacion, new.usuario_id)
+          is distinct from (old.chat_id, old.activo, old.rol, old.creado_en, old.codigo_vinculacion, old.usuario_id) then
+      raise exception 'Solo se pueden cambiar las preferencias de avisos';
+    end if;
+  end if;
+  return new;
+end $$;
+create trigger telegram_campos before insert or update on public.telegram_vinculos
+  for each row execute function public.tg_telegram_campos();
+
+-- ------------------------------------------- Funciones SECURITY DEFINER
+revoke execute on function public.crear_cuentas_por_defecto(uuid) from public, anon, authenticated;
+
+create or replace function public.socio_por_codigo(p_codigo text)
+returns table (id uuid, nombre text, tipo text, correo text)
+language sql stable security definer set search_path = public as $$
+  select id, nombre, tipo, null::text from socios
+   where codigo_referido = upper(trim(p_codigo)) and estado = 'activo' and auth.uid() is not null
+$$;
+
+create or replace function public.planilla_cerrada(p_planilla uuid) returns boolean
+language sql stable security definer set search_path = public as $$
+  select exists (select 1 from planillas p where p.id = p_planilla and p.estado = 'cerrada'
+                 and exists (select 1 from boletas b join empleados e on e.id = b.empleado_id
+                             where b.planilla_id = p.id and e.usuario_id = auth.uid()))
+      or exists (select 1 from planillas p where p.id = p_planilla and p.estado = 'cerrada'
+                 and public.puede_ver(p.empresa_id))
+$$;
+
+-- Vincular cuentas por correo solo si el correo está confirmado.
+create or replace function public.agregar_usuario_empresa(p_empresa uuid, p_correo text, p_rol text)
+returns uuid
+language plpgsql security definer set search_path = public as $$
+declare v_usuario uuid; v_id uuid;
+begin
+  if not public.es_admin_empresa(p_empresa) then raise exception 'Sin permiso'; end if;
+  select id into v_usuario from auth.users
+   where lower(email) = lower(trim(p_correo)) and email_confirmed_at is not null;
+  if v_usuario is null then return null; end if;
+  insert into usuarios_empresa (empresa_id, usuario_id, rol, creado_por)
+  values (p_empresa, v_usuario, p_rol, auth.uid())
+  on conflict (empresa_id, usuario_id) do update set rol = excluded.rol, activo = true
+  returning id into v_id;
+  return v_id;
+end $$;
+
+create or replace function public.buscar_usuario_por_correo(p_correo text, p_empresa uuid default null)
+returns uuid
+language plpgsql stable security definer set search_path = public as $$
+declare v_id uuid;
+begin
+  if not (public.es_admin_plataforma() or (p_empresa is not null and public.es_admin_empresa(p_empresa))) then
+    raise exception 'Sin permiso para buscar usuarios';
+  end if;
+  select id into v_id from auth.users
+   where lower(email) = lower(trim(p_correo)) and email_confirmed_at is not null limit 1;
+  -- Un administrador de empresa solo obtiene el id si la persona ya trabaja en esa empresa
+  -- o se va a vincular a ella; para no exponer cuentas ajenas se devuelve únicamente a la
+  -- plataforma o cuando la cuenta ya está ligada a esa empresa (como usuario o empleado).
+  if v_id is not null and not public.es_admin_plataforma() and not exists (
+       select 1 from usuarios_empresa where empresa_id = p_empresa and usuario_id = v_id)
+     and not exists (select 1 from empleados where empresa_id = p_empresa and lower(correo) = lower(trim(p_correo))) then
+    return null;
+  end if;
+  return v_id;
+end $$;
+
+-- Ninguna función nueva queda ejecutable por anon de forma implícita.
+alter default privileges in schema public revoke execute on functions from public;
+alter default privileges in schema negocio revoke execute on functions from public;
+
+
+-- >>>>>>>>>>>>>>>>>>>>>>>> 20261010001100_seguridad_avanzada.sql
+-- =============================================================================
+-- Planilla Costa Rica · 0011 Seguridad avanzada
+--   1. Mínimo privilegio: el rol anónimo no toca nada.
+--   2. Auditoría a prueba de alteraciones (cadena de hashes SHA-256, solo agregar).
+--   3. MFA (aal2) obligatoria en la base para aprobar, cerrar y reabrir planillas
+--      y autorizar salarios, cuando la API la exige.
+--   4. Idempotencia de operaciones (la API no repite un cierre o un envío).
+-- =============================================================================
+
+-- 1. ------------------------------------------------------- Mínimo privilegio
+revoke all on all tables in schema public from anon;
+revoke all on all sequences in schema public from anon;
+revoke all on all functions in schema public from anon;
+revoke all on schema negocio from anon;
+revoke all on all tables in schema negocio from anon;
+revoke all on all functions in schema negocio from anon;
+alter default privileges in schema public revoke all on tables from anon;
+alter default privileges in schema public revoke all on functions from anon;
+alter default privileges in schema negocio revoke all on tables from anon;
+
+-- 2. ------------------------------------------- Auditoría encadenada (append-only)
+alter table public.auditoria add column if not exists hash_anterior text;
+alter table public.auditoria add column if not exists hash text;
+
+create or replace function public.tg_auditoria_cadena() returns trigger
+language plpgsql security definer set search_path = public, extensions as $$
+declare v_prev text;
+begin
+  -- Un solo escritor a la vez para que la cadena quede en orden.
+  perform pg_advisory_xact_lock(hashtext('aurom.auditoria'));
+  select hash into v_prev from auditoria order by id desc limit 1;
+  new.fecha := clock_timestamp();
+  new.hash_anterior := coalesce(v_prev, 'GENESIS');
+  new.hash := encode(digest(
+      new.hash_anterior || '|' || coalesce(new.empresa_id::text, '') || '|' || new.tabla || '|' ||
+      coalesce(new.registro_id, '') || '|' || new.accion || '|' || coalesce(new.antes::text, '') || '|' ||
+      coalesce(new.despues::text, '') || '|' || coalesce(new.usuario_id::text, '') || '|' || to_char(new.fecha at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US'),
+      'sha256'), 'hex');
+  return new;
+end $$;
+drop trigger if exists auditoria_cadena on public.auditoria;
+create trigger auditoria_cadena before insert on public.auditoria
+  for each row execute function public.tg_auditoria_cadena();
+
+create or replace function public.tg_auditoria_inmutable() returns trigger
+language plpgsql as $$
+begin
+  raise exception 'La bitácora de auditoría no se puede modificar ni borrar';
+end $$;
+drop trigger if exists auditoria_inmutable on public.auditoria;
+create trigger auditoria_inmutable before update or delete on public.auditoria
+  for each row execute function public.tg_auditoria_inmutable();
+revoke truncate on public.auditoria from authenticated, anon;
+
+-- Verifica la cadena completa: devuelve el primer id alterado (o null si está íntegra).
+create or replace function public.verificar_auditoria()
+returns table (id_alterado bigint, revisados bigint)
+language plpgsql stable security definer set search_path = public, extensions as $$
+declare r record; v_prev text := 'GENESIS'; n bigint := 0; v_calc text;
+begin
+  if not public.es_admin_plataforma() and current_user = 'authenticated' then
+    raise exception 'Solo la plataforma verifica la bitácora completa';
+  end if;
+  for r in select * from auditoria where hash is not null order by id loop
+    n := n + 1;
+    v_calc := encode(digest(
+        r.hash_anterior || '|' || coalesce(r.empresa_id::text, '') || '|' || r.tabla || '|' ||
+        coalesce(r.registro_id, '') || '|' || r.accion || '|' || coalesce(r.antes::text, '') || '|' ||
+        coalesce(r.despues::text, '') || '|' || coalesce(r.usuario_id::text, '') || '|' || to_char(r.fecha at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US'),
+        'sha256'), 'hex');
+    if r.hash_anterior is distinct from v_prev or r.hash is distinct from v_calc then
+      id_alterado := r.id; revisados := n; return next; return;
+    end if;
+    v_prev := r.hash;
+  end loop;
+  id_alterado := null; revisados := n; return next;
+end $$;
+revoke all on function public.verificar_auditoria() from public;
+grant execute on function public.verificar_auditoria() to authenticated;
+
+-- 3. -------------------------------------------------------------------- MFA
+-- La API fija aurom.mfa_requerida = 'si' en producción. Con esa marca, las acciones
+-- críticas exigen que la sesión tenga segundo factor verificado (claim aal = aal2).
+create or replace function public.mfa_ok() returns boolean
+language sql stable as $$
+  select coalesce(current_setting('aurom.mfa_requerida', true), '') <> 'si'
+      or coalesce(auth.jwt() ->> 'aal', 'aal1') = 'aal2'
+$$;
+
+create or replace function public.tg_planilla_mfa() returns trigger
+language plpgsql as $$
+begin
+  if current_user = 'authenticated' and new.estado is distinct from old.estado
+     and (new.estado in ('aprobada','cerrada') or old.estado = 'cerrada') and not public.mfa_ok() then
+    raise exception 'Esta acción requiere verificación en dos pasos (MFA)';
+  end if;
+  return new;
+end $$;
+create trigger planilla_mfa before update on public.planillas
+  for each row execute function public.tg_planilla_mfa();
+
+create or replace function public.tg_historial_mfa() returns trigger
+language plpgsql as $$
+begin
+  if current_user = 'authenticated' and new.estado is distinct from old.estado and new.estado = 'autorizado'
+     and not public.mfa_ok() then
+    raise exception 'Autorizar salarios requiere verificación en dos pasos (MFA)';
+  end if;
+  return new;
+end $$;
+create trigger historial_mfa before update on public.historial_salarial
+  for each row execute function public.tg_historial_mfa();
+
+-- 4. ------------------------------------------------------------- Idempotencia
+create table if not exists public.idempotencia (
+  usuario_id uuid not null,
+  clave text not null check (length(clave) between 8 and 128),
+  metodo text not null,
+  ruta text not null,
+  huella text not null,                -- sha256 del cuerpo: la misma clave con otro cuerpo es un error
+  estado text not null default 'en_proceso' check (estado in ('en_proceso','listo')),
+  codigo_http int,
+  respuesta jsonb,
+  creado_en timestamptz not null default now(),
+  primary key (usuario_id, clave)
+);
+create index if not exists idempotencia_vieja on public.idempotencia (creado_en);
+alter table public.idempotencia enable row level security;
+-- Solo la API (conexión de sistema) la usa; ningún usuario la ve directamente.
+revoke all on public.idempotencia from anon, authenticated;
+
+-- 5. ---------------------------------------- Ejecución de funciones por rol
+-- Por defecto Postgres da EXECUTE a PUBLIC (incluye anon). Se quita y se concede
+-- solo a usuarios autenticados y al rol de servicio.
+revoke execute on all functions in schema public from public;
+revoke execute on all functions in schema negocio from public;
+grant execute on all functions in schema public to authenticated, service_role;
+grant execute on all functions in schema negocio to authenticated, service_role;
+-- Funciones internas que nadie debe llamar directamente.
+revoke execute on function public.crear_cuentas_por_defecto(uuid) from authenticated;
+revoke execute on function public._politicas_empresa(regclass) from authenticated;
+alter default privileges in schema public revoke execute on functions from public;
+alter default privileges in schema negocio revoke execute on functions from public;
+
+
+-- >>>>>>>>>>>>>>>>>>>>>>>> 20261010001200_seguridad_revision2.sql
+-- =============================================================================
+-- Planilla Costa Rica · 0012 Segunda revisión independiente de seguridad
+-- =============================================================================
+
+-- 1. ---------------------------------------- Nada se escribe desde PostgREST
+-- Dentro de una función SECURITY DEFINER el usuario efectivo es el dueño, así que la
+-- regla "solo desde la API" se apoya también en session_user: PostgREST siempre se
+-- conecta como 'authenticator'. Cualquier escritura que llegue por esa vía (aunque sea
+-- a través de una función) se rechaza si no viene marcada por la API.
+create or replace function public.tg_solo_api() returns trigger
+language plpgsql as $$
+begin
+  if (current_user = 'authenticated' or session_user = 'authenticator') and not public.via_api() then
+    raise exception 'Las modificaciones se hacen desde la aplicación Planilla Costa Rica';
+  end if;
+  return coalesce(new, old);
+end $$;
+
+-- 2. ------------------------------------------------ MFA también fuera de la API
+create table if not exists public.ajustes_seguridad (
+  clave text primary key,
+  valor text not null
+);
+insert into public.ajustes_seguridad (clave, valor) values ('mfa_requerida', 'no') on conflict do nothing;
+alter table public.ajustes_seguridad enable row level security;
+revoke all on public.ajustes_seguridad from anon, authenticated;
+
+-- MFA exigida si la API lo marca en la transacción o si está activada para toda la base
+-- (la API la activa al arrancar en producción).
+create or replace function public.mfa_ok() returns boolean
+language sql stable security definer set search_path = public as $$
+  select not (coalesce(current_setting('aurom.mfa_requerida', true), '') = 'si'
+              or exists (select 1 from ajustes_seguridad where clave = 'mfa_requerida' and valor = 'si'))
+      or coalesce(auth.jwt() ->> 'aal', 'aal1') = 'aal2'
+      or (auth.uid() is null and session_user <> 'authenticator')   -- tareas del sistema, sin usuario
+$$;
+
+-- Cambios salariales autorizados: al insertar y al actualizar.
+create or replace function public.tg_historial_mfa() returns trigger
+language plpgsql as $$
+begin
+  if (current_user = 'authenticated' or session_user = 'authenticator') and new.estado = 'autorizado'
+     and (tg_op = 'INSERT' or new.estado is distinct from old.estado) and not public.mfa_ok() then
+    raise exception 'Autorizar salarios requiere verificación en dos pasos (MFA)';
+  end if;
+  return new;
+end $$;
+drop trigger if exists historial_mfa on public.historial_salarial;
+create trigger historial_mfa before insert or update on public.historial_salarial
+  for each row execute function public.tg_historial_mfa();
+
+create or replace function public.tg_empleado_salario() returns trigger
+language plpgsql as $$
+begin
+  if current_user = 'authenticated' and new.salario_mensual is distinct from old.salario_mensual then
+    if not public.puede_aprobar(new.empresa_id) then
+      raise exception 'El salario se cambia con una solicitud de cambio salarial autorizada';
+    end if;
+    if not public.mfa_ok() then
+      raise exception 'Cambiar salarios requiere verificación en dos pasos (MFA)';
+    end if;
+  end if;
+  if new.empresa_id is distinct from old.empresa_id then
+    raise exception 'Un empleado no se puede mover de empresa';
+  end if;
+  return new;
+end $$;
+
+create or replace function public.tg_planilla_mfa() returns trigger
+language plpgsql as $$
+begin
+  if (current_user = 'authenticated' or session_user = 'authenticator') and new.estado is distinct from old.estado
+     and (new.estado in ('aprobada','cerrada') or old.estado = 'cerrada') and not public.mfa_ok() then
+    raise exception 'Esta acción requiere verificación en dos pasos (MFA)';
+  end if;
+  return new;
+end $$;
+
+-- Agregar usuarios a una empresa es una acción de administración: exige MFA.
+create or replace function public.agregar_usuario_empresa(p_empresa uuid, p_correo text, p_rol text)
+returns uuid
+language plpgsql security definer set search_path = public as $$
+declare v_usuario uuid; v_id uuid;
+begin
+  if not public.es_admin_empresa(p_empresa) then raise exception 'Sin permiso'; end if;
+  if not public.mfa_ok() then raise exception 'Esta acción requiere verificación en dos pasos (MFA)'; end if;
+  select id into v_usuario from auth.users
+   where lower(email) = lower(trim(p_correo)) and email_confirmed_at is not null;
+  if v_usuario is null then return null; end if;
+  insert into usuarios_empresa (empresa_id, usuario_id, rol, creado_por)
+  values (p_empresa, v_usuario, p_rol, auth.uid())
+  on conflict (empresa_id, usuario_id) do update set rol = excluded.rol, activo = true
+  returning id into v_id;
+  return v_id;
+end $$;
+
+-- 3. --------------------------------------------- Auditoría: orden sin carreras
+-- El id se asigna antes del bloqueo; el orden real de la cadena es `seq`, que se
+-- toma dentro del trigger con el bloqueo ya adquirido.
+create sequence if not exists public.auditoria_seq;
+alter table public.auditoria add column if not exists seq bigint;
+create unique index if not exists auditoria_seq_unico on public.auditoria (seq);
+
+create or replace function public.tg_auditoria_cadena() returns trigger
+language plpgsql security definer set search_path = public, extensions as $$
+declare v_prev text;
+begin
+  perform pg_advisory_xact_lock(hashtext('aurom.auditoria'));
+  select hash into v_prev from auditoria where seq is not null order by seq desc limit 1;
+  new.seq := nextval('public.auditoria_seq');
+  new.fecha := clock_timestamp();
+  new.hash_anterior := coalesce(v_prev, 'GENESIS');
+  new.hash := encode(digest(
+      new.seq::text || '|' || new.hash_anterior || '|' || coalesce(new.empresa_id::text, '') || '|' || new.tabla || '|' ||
+      coalesce(new.registro_id, '') || '|' || new.accion || '|' || coalesce(new.antes::text, '') || '|' ||
+      coalesce(new.despues::text, '') || '|' || coalesce(new.usuario_id::text, '') || '|' ||
+      to_char(new.fecha at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US'), 'sha256'), 'hex');
+  return new;
+end $$;
+
+drop function if exists public.verificar_auditoria();
+create or replace function public.verificar_auditoria()
+returns table (id_alterado bigint, revisados bigint, hash_final text)
+language plpgsql stable security definer set search_path = public, extensions as $$
+declare r record; v_prev text := 'GENESIS'; n bigint := 0; v_calc text; v_seq bigint := 0;
+begin
+  if not public.es_admin_plataforma() and (session_user = 'authenticator' or auth.uid() is not null) then
+    raise exception 'Solo la plataforma verifica la bitácora completa';
+  end if;
+  for r in select * from auditoria where seq is not null order by seq loop
+    n := n + 1;
+    v_calc := encode(digest(
+        r.seq::text || '|' || r.hash_anterior || '|' || coalesce(r.empresa_id::text, '') || '|' || r.tabla || '|' ||
+        coalesce(r.registro_id, '') || '|' || r.accion || '|' || coalesce(r.antes::text, '') || '|' ||
+        coalesce(r.despues::text, '') || '|' || coalesce(r.usuario_id::text, '') || '|' ||
+        to_char(r.fecha at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US'), 'sha256'), 'hex');
+    -- Un hueco en seq significa filas borradas.
+    if r.hash_anterior is distinct from v_prev or r.hash is distinct from v_calc or r.seq <> v_seq + 1 and v_seq > 0 then
+      id_alterado := r.id; revisados := n; hash_final := null; return next; return;
+    end if;
+    v_prev := r.hash; v_seq := r.seq;
+  end loop;
+  id_alterado := null; revisados := n; hash_final := v_prev; return next;
+end $$;
+revoke all on function public.verificar_auditoria() from public, anon, authenticated;
+grant execute on function public.verificar_auditoria() to authenticated, service_role;
+
+-- 4. ------------------------------------------------------------- TRUNCATE
+-- TRUNCATE no pasa por RLS ni por triggers de fila: nadie de la aplicación lo necesita.
+revoke truncate on all tables in schema public from authenticated, anon;
+revoke truncate on all tables in schema negocio from authenticated, anon;
+
+
+-- >>>>>>>>>>>>>>>>>>>>>>>> 20261012001300_modulos_contabilidad.sql
+-- =============================================================================
+-- Planilla Costa Rica · 0013 Módulos por empresa y módulo de Contabilidad
+--   1. Catálogo de módulos con precio de lista y activación por empresa (historial).
+--   2. Esquema `contabilidad`: catálogo de cuentas, diarios, periodos, asientos y
+--      líneas, con partida doble, numeración y periodos cerrados garantizados por
+--      la base (no solo por la API).
+-- =============================================================================
+
+-- 1. ----------------------------------------------------------------- Módulos
+create table public.modulos (
+  codigo text primary key check (codigo ~ '^[a-z_]{3,30}$'),
+  nombre text not null,
+  descripcion text not null,
+  orden int not null default 0,
+  -- Precio de lista mensual sin IVA. Cada cliente puede tener el suyo (negocio.clientes.precios_modulos).
+  precio_mensual numeric(14,2) not null,
+  precio_mensual_usd numeric(14,2) not null,
+  unidad text not null,                 -- lo que se mide para los bloques adicionales
+  incluidos int not null,               -- unidades incluidas en el precio base
+  tam_bloque int not null check (tam_bloque > 0),
+  precio_bloque numeric(14,2) not null,
+  precio_bloque_usd numeric(14,2) not null,
+  disponible boolean not null default true
+);
+insert into public.modulos (codigo, nombre, descripcion, orden, precio_mensual, precio_mensual_usd, unidad, incluidos,
+                            tam_bloque, precio_bloque, precio_bloque_usd) values
+  ('planilla', 'Planilla', 'Planillas, CCSS, INS, renta, aguinaldo, vacaciones, liquidaciones, boletas y reportes oficiales.',
+   1, 55000, 100, 'colaboradores', 50, 10, 11000, 20),
+  ('contabilidad', 'Contabilidad', 'Catálogo de cuentas, asientos, libros diario y mayor, balance de comprobación, '
+   'estados financieros y cierres. Recibe automáticamente los asientos de planilla.',
+   2, 45000, 90, 'asientos', 300, 100, 7500, 15);
+alter table public.modulos enable row level security;
+create policy ver on public.modulos for select to authenticated using (true);
+create policy gestionar on public.modulos for all to authenticated
+  using (public.es_admin_plataforma()) with check (public.es_admin_plataforma());
+grant select, insert, update on public.modulos to authenticated;
+
+-- Precio propio por cliente y módulo: {"contabilidad": {"precio_mensual": "40000", "incluidos": 500, ...}}
+alter table negocio.clientes add column if not exists precios_modulos jsonb not null default '{}'::jsonb;
+
+-- Cada activación es una fila: desde / hasta. Activa = hasta es null.
+-- Un módulo se cobra en el mes si estuvo activo algún día de ese mes.
+create table public.empresa_modulos (
+  id uuid primary key default gen_random_uuid(),
+  empresa_id uuid not null references public.empresas(id) on delete cascade,
+  modulo text not null references public.modulos(codigo),
+  desde date not null default (now() at time zone 'America/Costa_Rica')::date,
+  hasta date,
+  activado_por uuid default auth.uid(),
+  desactivado_por uuid,
+  creado_en timestamptz not null default now(),
+  check (hasta is null or hasta >= desde)
+);
+create unique index empresa_modulo_activo on public.empresa_modulos (empresa_id, modulo) where hasta is null;
+create index on public.empresa_modulos (empresa_id);
+alter table public.empresa_modulos enable row level security;
+create policy ver on public.empresa_modulos for select to authenticated using (public.puede_ver(empresa_id));
+-- Nadie escribe directo: solo con public.cambiar_modulo().
+grant select on public.empresa_modulos to authenticated;
+create trigger solo_api before insert or update or delete on public.empresa_modulos
+  for each row execute function public.tg_solo_api();
+create trigger auditar after insert or update or delete on public.empresa_modulos
+  for each row execute function public.tg_auditar();
+create trigger solo_api before insert or update or delete on public.modulos
+  for each row execute function public.tg_solo_api();
+
+-- Las empresas que ya existen usan Planilla desde que se crearon.
+insert into public.empresa_modulos (empresa_id, modulo, desde, activado_por)
+select id, 'planilla', creado_en::date, creado_por from public.empresas
+on conflict do nothing;
+
+-- Una empresa creada por otra vía (importación, SQL de la plataforma) nace con Planilla.
+-- crear_empresa() elige sus módulos y lo indica con la marca aurom.alta_modulos.
+create or replace function public.tg_empresa_modulo_inicial() returns trigger
+language plpgsql security definer set search_path = public as $$
+begin
+  if coalesce(current_setting('aurom.alta_modulos', true), '') <> 'si' then
+    insert into empresa_modulos (empresa_id, modulo, desde, activado_por)
+    values (new.id, 'planilla', coalesce(new.creado_en, now())::date, new.creado_por);
+  end if;
+  return new;
+end $$;
+create trigger empresa_modulo_inicial after insert on public.empresas
+  for each row execute function public.tg_empresa_modulo_inicial();
+revoke execute on function public.tg_empresa_modulo_inicial() from public, anon;
+
+create or replace function public.modulo_activo(p_empresa uuid, p_modulo text) returns boolean
+language sql stable security definer set search_path = public as $$
+  select exists (select 1 from empresa_modulos where empresa_id = p_empresa and modulo = p_modulo and hasta is null)
+$$;
+
+create or replace function public.modulos_activos(p_empresa uuid) returns text[]
+language sql stable security definer set search_path = public as $$
+  select coalesce(array_agg(m.modulo order by o.orden), '{}')
+    from empresa_modulos m join modulos o on o.codigo = m.modulo
+   where m.empresa_id = p_empresa and m.hasta is null and public.puede_ver(p_empresa)
+$$;
+
+-- 2. ------------------------------------------------------------ Contabilidad
+create schema if not exists contabilidad;
+grant usage on schema contabilidad to authenticated, service_role;
+revoke all on schema contabilidad from anon;
+
+create table contabilidad.cuentas (
+  id uuid primary key default gen_random_uuid(),
+  empresa_id uuid not null references public.empresas(id) on delete cascade,
+  codigo text not null check (codigo ~ '^[0-9A-Za-z][0-9A-Za-z._-]{0,29}$'),
+  nombre text not null check (length(trim(nombre)) between 2 and 150),
+  tipo text not null check (tipo in ('activo','pasivo','patrimonio','ingreso','costo','gasto')),
+  naturaleza text not null check (naturaleza in ('deudora','acreedora')),
+  padre_id uuid,
+  acepta_movimientos boolean not null default true,
+  activa boolean not null default true,
+  descripcion text check (length(descripcion) <= 500),
+  creado_en timestamptz not null default now(),
+  creado_por uuid default auth.uid(),
+  unique (empresa_id, codigo),
+  unique (empresa_id, id),
+  foreign key (empresa_id, padre_id) references contabilidad.cuentas(empresa_id, id)
+);
+create index on contabilidad.cuentas (empresa_id, padre_id);
+
+create table contabilidad.diarios (
+  id uuid primary key default gen_random_uuid(),
+  empresa_id uuid not null references public.empresas(id) on delete cascade,
+  codigo text not null check (codigo ~ '^[A-Z]{2,5}$'),
+  nombre text not null,
+  unique (empresa_id, codigo),
+  unique (empresa_id, id)
+);
+
+-- Un mes sin fila está abierto.
+create table contabilidad.periodos (
+  empresa_id uuid not null references public.empresas(id) on delete cascade,
+  anio int not null check (anio between 2000 and 2100),
+  mes int not null check (mes between 1 and 12),
+  estado text not null default 'abierto' check (estado in ('abierto','cerrado')),
+  cerrado_por uuid,
+  cerrado_en timestamptz,
+  motivo_reapertura text,
+  reabierto_por uuid,
+  reabierto_en timestamptz,
+  primary key (empresa_id, anio, mes)
+);
+
+create table contabilidad.asientos (
+  id uuid primary key default gen_random_uuid(),
+  empresa_id uuid not null references public.empresas(id) on delete cascade,
+  diario_id uuid not null,
+  numero text,                                  -- GEN-2026-000001: se asigna al contabilizar
+  fecha date not null,
+  descripcion text not null check (length(trim(descripcion)) between 2 and 300),
+  referencia text check (length(referencia) <= 100),
+  origen text not null default 'manual'
+    check (origen in ('manual','apertura','planilla','aguinaldo','liquidacion','reversion','cierre')),
+  origen_id uuid,
+  estado text not null default 'borrador' check (estado in ('borrador','contabilizado','revertido')),
+  revierte_a uuid,                              -- en una reversión: el asiento que anula
+  revertido_por uuid,                           -- en el original: su reversión
+  total_debito numeric(16,2) not null default 0,
+  total_credito numeric(16,2) not null default 0,
+  advertencia text,
+  creado_en timestamptz not null default now(),
+  creado_por uuid default auth.uid(),
+  contabilizado_en timestamptz,
+  contabilizado_por uuid,
+  unique (empresa_id, numero),
+  unique (empresa_id, id),
+  foreign key (empresa_id, diario_id) references contabilidad.diarios(empresa_id, id),
+  foreign key (empresa_id, revierte_a) references contabilidad.asientos(empresa_id, id),
+  foreign key (empresa_id, revertido_por) references contabilidad.asientos(empresa_id, id),
+  check (estado = 'borrador' or (numero is not null and total_debito = total_credito and total_debito > 0))
+);
+create index on contabilidad.asientos (empresa_id, fecha);
+create index on contabilidad.asientos (empresa_id, origen, origen_id);
+create unique index asiento_una_reversion on contabilidad.asientos (revierte_a) where revierte_a is not null;
+
+create table contabilidad.lineas (
+  id uuid primary key default gen_random_uuid(),
+  empresa_id uuid not null references public.empresas(id) on delete cascade,
+  asiento_id uuid not null,
+  cuenta_id uuid not null,
+  descripcion text check (length(descripcion) <= 200),
+  debito numeric(16,2) not null default 0 check (debito >= 0),
+  credito numeric(16,2) not null default 0 check (credito >= 0),
+  orden int not null default 0,
+  check ((debito > 0) <> (credito > 0)),
+  foreign key (empresa_id, asiento_id) references contabilidad.asientos(empresa_id, id) on delete cascade,
+  foreign key (empresa_id, cuenta_id) references contabilidad.cuentas(empresa_id, id)
+);
+create index on contabilidad.lineas (asiento_id);
+create index on contabilidad.lineas (empresa_id, cuenta_id);
+
+create table contabilidad.consecutivos (
+  empresa_id uuid not null references public.empresas(id) on delete cascade,
+  diario_id uuid not null,
+  anio int not null,
+  ultimo int not null default 0,
+  primary key (empresa_id, diario_id, anio)
+);
+
+create table contabilidad.cierres_anuales (
+  empresa_id uuid not null references public.empresas(id) on delete cascade,
+  anio int not null,
+  asiento_id uuid not null,
+  cerrado_por uuid default auth.uid(),
+  cerrado_en timestamptz not null default now(),
+  primary key (empresa_id, anio),
+  foreign key (empresa_id, asiento_id) references contabilidad.asientos(empresa_id, id)
+);
+
+-- ---------------------------------------------------------------- Permisos
+-- Igual que el resto: ver con acceso a la empresa; escribir si puede operar, la empresa
+-- está al día y el módulo está activo.
+create or replace function contabilidad._politicas(p_tabla regclass) returns void
+language plpgsql as $$
+begin
+  execute format('alter table %s enable row level security', p_tabla);
+  execute format('create policy ver on %s for select to authenticated using (public.puede_ver(empresa_id))', p_tabla);
+  execute format('create policy crear on %s for insert to authenticated with check (public.puede_operar(empresa_id) '
+                 'and public.empresa_escribible(empresa_id) and public.modulo_activo(empresa_id, ''contabilidad''))', p_tabla);
+  execute format('create policy editar on %s for update to authenticated using (public.puede_operar(empresa_id)) '
+                 'with check (public.puede_operar(empresa_id) and public.empresa_escribible(empresa_id) '
+                 'and public.modulo_activo(empresa_id, ''contabilidad''))', p_tabla);
+  execute format('create policy borrar on %s for delete to authenticated using (public.puede_operar(empresa_id) '
+                 'and public.empresa_escribible(empresa_id) and public.modulo_activo(empresa_id, ''contabilidad''))', p_tabla);
+  execute format('grant select, insert, update, delete on %s to authenticated', p_tabla);
+  execute format('create trigger solo_api before insert or update or delete on %s '
+                 'for each row execute function public.tg_solo_api()', p_tabla);
+end $$;
+select contabilidad._politicas(t::regclass) from unnest(array[
+  'contabilidad.cuentas', 'contabilidad.diarios', 'contabilidad.periodos', 'contabilidad.asientos',
+  'contabilidad.lineas', 'contabilidad.cierres_anuales']) t;
+-- Los consecutivos solo los toca el trigger de contabilizar.
+alter table contabilidad.consecutivos enable row level security;
+revoke all on contabilidad.consecutivos from authenticated, anon;
+revoke truncate on all tables in schema contabilidad from authenticated, anon;
+revoke execute on function contabilidad._politicas(regclass) from public, authenticated;
+
+-- Bitácora con el nombre de esquema (hay "asientos" de planilla y de contabilidad).
+create or replace function public.tg_auditar_esquema() returns trigger
+language plpgsql security definer set search_path = public as $$
+declare
+  v_row jsonb := to_jsonb(coalesce(new, old));
+begin
+  insert into auditoria (empresa_id, tabla, registro_id, accion, antes, despues, usuario_id)
+  values (nullif(v_row ->> 'empresa_id', '')::uuid, tg_table_schema || '.' || tg_table_name,
+          coalesce(v_row ->> 'id', (v_row ->> 'anio') || '-' || coalesce(v_row ->> 'mes', '')), tg_op,
+          case when tg_op <> 'INSERT' then to_jsonb(old) end,
+          case when tg_op <> 'DELETE' then to_jsonb(new) end,
+          auth.uid());
+  return coalesce(new, old);
+end $$;
+create trigger auditar after insert or update or delete on contabilidad.cuentas
+  for each row execute function public.tg_auditar_esquema();
+create trigger auditar after insert or update or delete on contabilidad.asientos
+  for each row execute function public.tg_auditar_esquema();
+create trigger auditar after insert or update or delete on contabilidad.periodos
+  for each row execute function public.tg_auditar_esquema();
+create trigger auditar after insert or update or delete on contabilidad.cierres_anuales
+  for each row execute function public.tg_auditar_esquema();
+
+-- ------------------------------------------------------------- Integridad
+create or replace function contabilidad.periodo_abierto(p_empresa uuid, p_fecha date) returns boolean
+language sql stable security definer set search_path = contabilidad, public as $$
+  select not exists (select 1 from periodos where empresa_id = p_empresa and estado = 'cerrado'
+                       and anio = extract(year from p_fecha)::int and mes = extract(month from p_fecha)::int)
+$$;
+
+-- Cuentas: jerarquía sin ciclos, mismo tipo que el grupo, y nada que rompa los saldos.
+create or replace function contabilidad.tg_cuenta() returns trigger
+language plpgsql security definer set search_path = contabilidad, public as $$
+declare v_padre record; v_tiene boolean; v_cursor uuid; n int := 0;
+begin
+  if tg_op = 'UPDATE' and new.empresa_id is distinct from old.empresa_id then
+    raise exception 'Una cuenta no se puede mover de empresa';
+  end if;
+  v_tiene := tg_op = 'UPDATE' and exists (select 1 from lineas where cuenta_id = old.id);
+  if v_tiene and (new.tipo is distinct from old.tipo or new.naturaleza is distinct from old.naturaleza) then
+    raise exception 'La cuenta % ya tiene movimientos: no se puede cambiar su tipo ni su naturaleza', old.codigo;
+  end if;
+  if v_tiene and old.acepta_movimientos and not new.acepta_movimientos then
+    raise exception 'La cuenta % ya tiene movimientos: no se puede convertir en cuenta de agrupación', old.codigo;
+  end if;
+  if new.acepta_movimientos and tg_op = 'UPDATE' and not old.acepta_movimientos
+     and exists (select 1 from cuentas where padre_id = new.id) then
+    raise exception 'La cuenta % tiene subcuentas: no puede recibir movimientos', new.codigo;
+  end if;
+  if new.padre_id is not null then
+    select * into v_padre from cuentas where id = new.padre_id and empresa_id = new.empresa_id;
+    if not found then raise exception 'La cuenta de agrupación no existe'; end if;
+    if v_padre.tipo <> new.tipo then
+      raise exception 'La subcuenta debe ser del mismo tipo que su grupo % (%)', v_padre.codigo, v_padre.tipo;
+    end if;
+    -- Sin ciclos: subir por los padres no debe volver a esta cuenta.
+    v_cursor := new.padre_id;
+    while v_cursor is not null loop
+      if v_cursor = new.id then raise exception 'La jerarquía de cuentas no puede formar un ciclo'; end if;
+      n := n + 1;
+      if n > 20 then raise exception 'La jerarquía de cuentas es demasiado profunda'; end if;
+      select padre_id into v_cursor from cuentas where id = v_cursor;
+    end loop;
+    -- El grupo deja de recibir movimientos (si todavía no tiene ninguno).
+    if v_padre.acepta_movimientos then
+      if exists (select 1 from lineas where cuenta_id = v_padre.id) then
+        raise exception 'La cuenta % ya tiene movimientos: no puede tener subcuentas', v_padre.codigo;
+      end if;
+      update cuentas set acepta_movimientos = false where id = v_padre.id;
+    end if;
+  end if;
+  return new;
+end $$;
+create trigger cuenta_reglas before insert or update on contabilidad.cuentas
+  for each row execute function contabilidad.tg_cuenta();
+
+-- Asientos: borrador editable; contabilizado inmutable (se corrige con reversión).
+create or replace function contabilidad.tg_asiento() returns trigger
+language plpgsql security definer set search_path = contabilidad, public as $$
+declare v_deb numeric; v_cre numeric; v_n int; v_malas text; v_diario text; v_num int;
+begin
+  if tg_op = 'INSERT' then
+    if new.estado <> 'borrador' then raise exception 'Un asiento nace como borrador y luego se contabiliza'; end if;
+    new.numero := null; new.revertido_por := null; new.contabilizado_en := null; new.contabilizado_por := null;
+    return new;
+  end if;
+  if tg_op = 'DELETE' then
+    -- Al borrar la empresa completa (derecho de eliminación) se va todo.
+    if old.estado <> 'borrador' and exists (select 1 from public.empresas where id = old.empresa_id) then
+      raise exception 'Un asiento contabilizado no se borra: haga una reversión';
+    end if;
+    return old;
+  end if;
+  -- UPDATE
+  if new.empresa_id is distinct from old.empresa_id then raise exception 'Un asiento no se puede mover de empresa'; end if;
+  if old.estado = 'revertido' then raise exception 'El asiento ya fue revertido'; end if;
+  if old.estado = 'contabilizado' then
+    if new.estado = 'revertido' and new.revertido_por is not null
+       and (new.fecha, new.diario_id, new.descripcion, new.numero, new.total_debito, new.origen, new.origen_id)
+           is not distinct from (old.fecha, old.diario_id, old.descripcion, old.numero, old.total_debito, old.origen, old.origen_id) then
+      return new;
+    end if;
+    raise exception 'Un asiento contabilizado no se modifica: haga una reversión';
+  end if;
+  if new.estado = 'revertido' then raise exception 'Solo un asiento contabilizado se puede revertir'; end if;
+  if new.estado = 'contabilizado' then
+    if not contabilidad.periodo_abierto(new.empresa_id, new.fecha) then
+      raise exception 'El periodo % de % está cerrado', extract(month from new.fecha)::int, extract(year from new.fecha)::int;
+    end if;
+    select coalesce(sum(debito), 0), coalesce(sum(credito), 0), count(*) into v_deb, v_cre, v_n
+      from lineas where asiento_id = new.id;
+    if v_n < 2 then raise exception 'El asiento necesita al menos dos líneas'; end if;
+    if v_deb <> v_cre then raise exception 'El asiento no cuadra: débitos % y créditos %', v_deb, v_cre; end if;
+    if v_deb = 0 then raise exception 'El asiento no tiene montos'; end if;
+    select string_agg(distinct c.codigo, ', ') into v_malas
+      from lineas l join cuentas c on c.id = l.cuenta_id
+     where l.asiento_id = new.id and (not c.acepta_movimientos or not c.activa);
+    if v_malas is not null then
+      raise exception 'Estas cuentas no reciben movimientos (agrupación o inactivas): %', v_malas;
+    end if;
+    select codigo into v_diario from diarios where id = new.diario_id;
+    insert into consecutivos (empresa_id, diario_id, anio, ultimo)
+    values (new.empresa_id, new.diario_id, extract(year from new.fecha)::int, 1)
+    on conflict (empresa_id, diario_id, anio) do update set ultimo = consecutivos.ultimo + 1
+    returning ultimo into v_num;
+    new.numero := v_diario || '-' || extract(year from new.fecha)::int || '-' || lpad(v_num::text, 6, '0');
+    new.total_debito := v_deb; new.total_credito := v_cre;
+    new.contabilizado_en := now(); new.contabilizado_por := auth.uid();
+  else
+    new.numero := null;
+  end if;
+  return new;
+end $$;
+create trigger asiento_reglas before insert or update or delete on contabilidad.asientos
+  for each row execute function contabilidad.tg_asiento();
+
+create or replace function contabilidad.tg_linea() returns trigger
+language plpgsql security definer set search_path = contabilidad, public as $$
+declare v_estado text;
+begin
+  select estado into v_estado from asientos where id = coalesce(new.asiento_id, old.asiento_id);
+  if v_estado is not null and v_estado <> 'borrador'
+     and exists (select 1 from public.empresas where id = coalesce(new.empresa_id, old.empresa_id)) then
+    raise exception 'Las líneas de un asiento contabilizado no se modifican';
+  end if;
+  if tg_op = 'UPDATE' and (new.asiento_id is distinct from old.asiento_id or new.empresa_id is distinct from old.empresa_id) then
+    raise exception 'Una línea no se mueve a otro asiento';
+  end if;
+  return coalesce(new, old);
+end $$;
+create trigger linea_reglas before insert or update or delete on contabilidad.lineas
+  for each row execute function contabilidad.tg_linea();
+
+-- Periodos: cerrar y reabrir es de aprobadores, con segundo factor.
+create or replace function contabilidad.tg_periodo() returns trigger
+language plpgsql as $$
+begin
+  if (current_user = 'authenticated' or session_user = 'authenticator') then
+    if not public.puede_aprobar(new.empresa_id) then
+      raise exception 'Solo un aprobador o administrador cierra y reabre periodos contables';
+    end if;
+    if not public.mfa_ok() then raise exception 'Cerrar o reabrir periodos requiere verificación en dos pasos (MFA)'; end if;
+  end if;
+  if tg_op = 'UPDATE' and (new.empresa_id, new.anio, new.mes) is distinct from (old.empresa_id, old.anio, old.mes) then
+    raise exception 'El periodo no se puede cambiar de fecha';
+  end if;
+  if tg_op = 'UPDATE' and old.estado = 'cerrado' and new.estado = 'abierto'
+     and exists (select 1 from contabilidad.cierres_anuales where empresa_id = new.empresa_id and anio = new.anio) then
+    raise exception 'El año % tiene cierre anual: reabra primero el año', new.anio;
+  end if;
+  return new;
+end $$;
+create trigger periodo_reglas before insert or update on contabilidad.periodos
+  for each row execute function contabilidad.tg_periodo();
+
+-- ------------------------------------------------- Catálogo inicial (NIIF PYMES)
+-- Códigos compatibles con las cuentas por defecto de planilla (5101..., 2101..., 1205, 1206).
+create or replace function contabilidad.inicializar(p_empresa uuid) returns void
+language plpgsql security definer set search_path = contabilidad, public as $$
+begin
+  if not public.es_admin_empresa(p_empresa) and auth.uid() is not null then
+    raise exception 'Sin permiso';
+  end if;
+  insert into diarios (empresa_id, codigo, nombre) values
+    (p_empresa, 'GEN', 'General'), (p_empresa, 'PLA', 'Planillas'), (p_empresa, 'VEN', 'Ventas'),
+    (p_empresa, 'COM', 'Compras y gastos'), (p_empresa, 'BAN', 'Bancos'), (p_empresa, 'AJU', 'Ajustes'),
+    (p_empresa, 'APE', 'Apertura'), (p_empresa, 'CIE', 'Cierre')
+  on conflict (empresa_id, codigo) do nothing;
+  if exists (select 1 from cuentas where empresa_id = p_empresa) then
+    return;
+  end if;
+  -- (código, nombre, tipo, naturaleza, recibe movimientos)
+  insert into cuentas (empresa_id, codigo, nombre, tipo, naturaleza, acepta_movimientos)
+  select p_empresa, c.codigo, c.nombre, c.tipo, c.naturaleza, c.mov from (values
+    ('1','ACTIVO','activo','deudora',false),
+    ('11','Activo corriente','activo','deudora',false),
+    ('1101','Caja general','activo','deudora',true),
+    ('1102','Caja chica','activo','deudora',true),
+    ('1103','Bancos','activo','deudora',true),
+    ('12','Cuentas por cobrar','activo','deudora',false),
+    ('1201','Cuentas por cobrar a clientes','activo','deudora',true),
+    ('1202','Estimación para incobrables','activo','acreedora',true),
+    ('1203','IVA soportado (crédito fiscal)','activo','deudora',true),
+    ('1204','Pagos parciales de impuesto sobre la renta','activo','deudora',true),
+    ('1205','Préstamos a empleados','activo','deudora',true),
+    ('1206','Subsidios CCSS por cobrar','activo','deudora',true),
+    ('1207','Otras cuentas por cobrar','activo','deudora',true),
+    ('13','Inventarios','activo','deudora',false),
+    ('1301','Inventario de mercadería','activo','deudora',true),
+    ('14','Gastos pagados por anticipado','activo','deudora',false),
+    ('1401','Seguros pagados por anticipado','activo','deudora',true),
+    ('1402','Alquileres pagados por anticipado','activo','deudora',true),
+    ('15','Propiedad, planta y equipo','activo','deudora',false),
+    ('1501','Terrenos','activo','deudora',true),
+    ('1502','Edificios','activo','deudora',true),
+    ('1503','Mobiliario y equipo de oficina','activo','deudora',true),
+    ('1504','Equipo de cómputo','activo','deudora',true),
+    ('1505','Vehículos','activo','deudora',true),
+    ('1509','Depreciación acumulada','activo','acreedora',true),
+    ('16','Otros activos','activo','deudora',false),
+    ('1601','Depósitos en garantía','activo','deudora',true),
+    ('2','PASIVO','pasivo','acreedora',false),
+    ('21','Pasivo corriente','pasivo','acreedora',false),
+    ('2101','Salarios por pagar','pasivo','acreedora',true),
+    ('2102','CCSS por pagar','pasivo','acreedora',true),
+    ('2103','INS riesgos del trabajo por pagar','pasivo','acreedora',true),
+    ('2104','Impuesto al salario retenido','pasivo','acreedora',true),
+    ('2105','ROP por pagar','pasivo','acreedora',true),
+    ('2106','Embargos y pensiones por pagar','pasivo','acreedora',true),
+    ('2107','Otras retenciones a empleados','pasivo','acreedora',true),
+    ('2111','Provisión aguinaldo','pasivo','acreedora',true),
+    ('2112','Provisión vacaciones','pasivo','acreedora',true),
+    ('2113','Provisión cesantía','pasivo','acreedora',true),
+    ('2120','Cuentas por pagar a proveedores','pasivo','acreedora',true),
+    ('2121','IVA por pagar (débito fiscal)','pasivo','acreedora',true),
+    ('2122','Impuesto sobre la renta por pagar','pasivo','acreedora',true),
+    ('2123','Retenciones por pagar','pasivo','acreedora',true),
+    ('2124','Gastos acumulados por pagar','pasivo','acreedora',true),
+    ('2125','Préstamos bancarios a corto plazo','pasivo','acreedora',true),
+    ('2126','Anticipos de clientes','pasivo','acreedora',true),
+    ('22','Pasivo no corriente','pasivo','acreedora',false),
+    ('2201','Préstamos bancarios a largo plazo','pasivo','acreedora',true),
+    ('3','PATRIMONIO','patrimonio','acreedora',false),
+    ('31','Capital','patrimonio','acreedora',false),
+    ('3101','Capital social','patrimonio','acreedora',true),
+    ('32','Reservas','patrimonio','acreedora',false),
+    ('3201','Reserva legal','patrimonio','acreedora',true),
+    ('33','Resultados','patrimonio','acreedora',false),
+    ('3301','Utilidades acumuladas','patrimonio','acreedora',true),
+    ('4','INGRESOS','ingreso','acreedora',false),
+    ('41','Ingresos de operación','ingreso','acreedora',false),
+    ('4101','Ventas de mercadería','ingreso','acreedora',true),
+    ('4102','Ventas de servicios','ingreso','acreedora',true),
+    ('4103','Devoluciones y descuentos sobre ventas','ingreso','deudora',true),
+    ('42','Otros ingresos','ingreso','acreedora',false),
+    ('4201','Ingresos financieros','ingreso','acreedora',true),
+    ('4202','Diferencial cambiario ganado','ingreso','acreedora',true),
+    ('4203','Otros ingresos','ingreso','acreedora',true),
+    ('5','GASTOS','gasto','deudora',false),
+    ('51','Gastos de personal','gasto','deudora',false),
+    ('5101','Sueldos y salarios','gasto','deudora',true),
+    ('5102','Cargas sociales patronales','gasto','deudora',true),
+    ('5103','Aguinaldo','gasto','deudora',true),
+    ('5104','Vacaciones','gasto','deudora',true),
+    ('5105','Cesantía','gasto','deudora',true),
+    ('5106','Incapacidades a cargo del patrono','gasto','deudora',true),
+    ('52','Gastos generales y administrativos','gasto','deudora',false),
+    ('5201','Alquileres','gasto','deudora',true),
+    ('5202','Electricidad y agua','gasto','deudora',true),
+    ('5203','Teléfono e internet','gasto','deudora',true),
+    ('5204','Honorarios profesionales','gasto','deudora',true),
+    ('5205','Papelería y útiles','gasto','deudora',true),
+    ('5206','Mantenimiento y reparaciones','gasto','deudora',true),
+    ('5207','Seguros','gasto','deudora',true),
+    ('5208','Publicidad y mercadeo','gasto','deudora',true),
+    ('5209','Combustible y transporte','gasto','deudora',true),
+    ('5210','Depreciación','gasto','deudora',true),
+    ('5211','Patentes e impuestos municipales','gasto','deudora',true),
+    ('5212','Software y suscripciones','gasto','deudora',true),
+    ('5299','Otros gastos','gasto','deudora',true),
+    ('53','Gastos financieros','gasto','deudora',false),
+    ('5301','Intereses','gasto','deudora',true),
+    ('5302','Comisiones bancarias','gasto','deudora',true),
+    ('5303','Diferencial cambiario perdido','gasto','deudora',true),
+    ('54','Impuesto sobre la renta','gasto','deudora',false),
+    ('5401','Gasto por impuesto sobre la renta','gasto','deudora',true),
+    ('6','COSTOS','costo','deudora',false),
+    ('61','Costo de ventas','costo','deudora',false),
+    ('6101','Costo de mercadería vendida','costo','deudora',true),
+    ('6102','Costo de servicios prestados','costo','deudora',true)
+  ) as c(codigo, nombre, tipo, naturaleza, mov);
+  -- Padre = el grupo con el código más largo que sea prefijo.
+  update cuentas c set padre_id = (
+      select p.id from cuentas p
+       where p.empresa_id = c.empresa_id and p.codigo <> c.codigo and not p.acepta_movimientos
+         and c.codigo like p.codigo || '%'
+       order by length(p.codigo) desc limit 1)
+   where c.empresa_id = p_empresa;
+end $$;
+revoke execute on function contabilidad.inicializar(uuid) from public;
+
+-- ---------------------------------------- Activar y desactivar módulos
+-- Lo hace el administrador de la empresa (con MFA) o la plataforma. El historial queda
+-- en empresa_modulos y en la bitácora. Siempre debe quedar al menos un módulo activo.
+create or replace function public.cambiar_modulo(p_empresa uuid, p_modulo text, p_activo boolean) returns text[]
+language plpgsql security definer set search_path = public as $$
+declare v_hoy date := (now() at time zone 'America/Costa_Rica')::date;
+begin
+  if not public.es_admin_empresa(p_empresa) then raise exception 'Solo el administrador de la empresa cambia los módulos'; end if;
+  if not public.mfa_ok() then raise exception 'Cambiar los módulos requiere verificación en dos pasos (MFA)'; end if;
+  if not exists (select 1 from modulos where codigo = p_modulo and (disponible or not p_activo)) then
+    raise exception 'Módulo no disponible: %', p_modulo;
+  end if;
+  if p_activo then
+    if not public.modulo_activo(p_empresa, p_modulo) then
+      if exists (select 1 from empresas where id = p_empresa and estado_servicio in ('solo_lectura','suspendido','baja'))
+         and not public.es_admin_plataforma() then
+        raise exception 'Regularice la suscripción antes de activar otro módulo';
+      end if;
+      insert into empresa_modulos (empresa_id, modulo, desde, activado_por) values (p_empresa, p_modulo, v_hoy, auth.uid());
+    end if;
+    if p_modulo = 'contabilidad' then
+      perform contabilidad.inicializar(p_empresa);
+    end if;
+  else
+    if not exists (select 1 from empresa_modulos where empresa_id = p_empresa and hasta is null and modulo <> p_modulo) then
+      raise exception 'La empresa debe tener al menos un módulo activo';
+    end if;
+    update empresa_modulos set hasta = v_hoy, desactivado_por = auth.uid()
+     where empresa_id = p_empresa and modulo = p_modulo and hasta is null;
+  end if;
+  return public.modulos_activos(p_empresa);
+end $$;
+revoke execute on function public.cambiar_modulo(uuid, text, boolean) from public, anon;
+grant execute on function public.cambiar_modulo(uuid, text, boolean) to authenticated;
+
+-- Alta de empresa eligiendo los módulos (por defecto, Planilla).
+drop function if exists public.crear_empresa(text, text, text, text);
+create or replace function public.crear_empresa(
+  p_nombre text, p_cedula text default null, p_codigo_referido text default null,
+  p_frecuencia text default 'biweekly', p_modulos text[] default array['planilla']
+) returns uuid
+language plpgsql security definer set search_path = public as $$
+declare
+  v_empresa uuid;
+  v_socio uuid;
+  v_tipo text;
+  v_mod text;
+begin
+  if auth.uid() is null then raise exception 'Debe iniciar sesión'; end if;
+  if coalesce(array_length(p_modulos, 1), 0) = 0 then raise exception 'Elija al menos un módulo'; end if;
+  if exists (select 1 from unnest(p_modulos) m where m not in (select codigo from modulos where disponible)) then
+    raise exception 'Módulo no disponible';
+  end if;
+  if p_codigo_referido is not null then
+    select id, tipo into v_socio, v_tipo from socios
+     where codigo_referido = upper(trim(p_codigo_referido)) and estado = 'activo';
+  end if;
+
+  perform set_config('aurom.alta_modulos', 'si', true);
+  insert into empresas (nombre, cedula_juridica, estado_servicio, referido_por, creado_por)
+  values (p_nombre, p_cedula, 'prueba', v_socio, auth.uid()) returning id into v_empresa;
+  perform set_config('aurom.alta_modulos', '', true);
+  insert into usuarios_empresa (empresa_id, usuario_id, rol, creado_por) values (v_empresa, auth.uid(), 'admin', auth.uid());
+  insert into configuracion_planilla (empresa_id) values (v_empresa);
+  insert into calendarios_pago (empresa_id, nombre, frecuencia)
+  values (v_empresa, case p_frecuencia when 'monthly' then 'Mensual' when 'weekly' then 'Semanal' else 'Quincenal' end, p_frecuencia);
+  perform crear_cuentas_por_defecto(v_empresa);
+  foreach v_mod in array (select array_agg(distinct m) from unnest(p_modulos) m) loop
+    insert into empresa_modulos (empresa_id, modulo, activado_por) values (v_empresa, v_mod, auth.uid());
+  end loop;
+  if 'contabilidad' = any(p_modulos) then
+    perform contabilidad.inicializar(v_empresa);
+  end if;
+
+  if v_socio is not null then
+    insert into asignaciones_contador (empresa_id, socio_id, funciones, permiso, soporte_principal, asignado_por)
+    values (v_empresa, v_socio,
+            case v_tipo when 'contador' then array['supervision','soporte','implementacion']
+                        else array['ventas','implementacion'] end,
+            'operacion', v_tipo = 'contador', auth.uid());
+  end if;
+  return v_empresa;
+end $$;
+revoke execute on function public.crear_empresa(text, text, text, text, text[]) from public, anon;
+grant execute on function public.crear_empresa(text, text, text, text, text[]) to authenticated;
+
+-- Planilla también se respeta en la base: sin el módulo no se crean planillas.
+create or replace function public.tg_planilla_nueva() returns trigger
+language plpgsql as $$
+begin
+  if current_user = 'authenticated' or session_user = 'authenticator' then
+    if not public.modulo_activo(new.empresa_id, 'planilla') then
+      raise exception 'El módulo Planilla no está activo para esta empresa';
+    end if;
+    new.estado := 'borrador'; new.aprobada_por := null; new.aprobada_en := null;
+    new.cerrada_por := null; new.cerrada_en := null;
+  end if;
+  return new;
+end $$;
+
+-- Ejecución de funciones: igual que en public (0011), solo usuarios autenticados.
+revoke execute on all functions in schema contabilidad from public, anon;
+grant execute on function contabilidad.periodo_abierto(uuid, date) to authenticated, service_role;
+grant execute on function contabilidad.tg_cuenta() to authenticated;
+grant execute on function contabilidad.tg_asiento() to authenticated;
+grant execute on function contabilidad.tg_linea() to authenticated;
+grant execute on function contabilidad.tg_periodo() to authenticated;
+grant execute on function contabilidad.inicializar(uuid) to authenticated;
+revoke execute on function public.modulo_activo(uuid, text) from public, anon;
+grant execute on function public.modulo_activo(uuid, text) to authenticated, service_role;
+revoke execute on function public.modulos_activos(uuid) from public, anon;
+grant execute on function public.modulos_activos(uuid) to authenticated, service_role;
+revoke execute on function public.tg_auditar_esquema() from public, anon;
+alter default privileges in schema contabilidad revoke execute on functions from public;
+
+-- ------------------------------------------- Bitácora: secuencia sin huecos
+-- Con nextval(), una transacción que se deshace (un error de validación cualquiera)
+-- dejaba un hueco en `seq` y la verificación lo reportaba como filas borradas.
+-- El número se toma ahora del último registro confirmado, con el bloqueo ya adquirido.
+create or replace function public.tg_auditoria_cadena() returns trigger
+language plpgsql security definer set search_path = public, extensions as $$
+declare v_prev text; v_seq bigint;
+begin
+  perform pg_advisory_xact_lock(hashtext('aurom.auditoria'));
+  select hash, seq into v_prev, v_seq from auditoria where seq is not null order by seq desc limit 1;
+  new.seq := coalesce(v_seq, 0) + 1;
+  new.fecha := clock_timestamp();
+  new.hash_anterior := coalesce(v_prev, 'GENESIS');
+  new.hash := encode(digest(
+      new.seq::text || '|' || new.hash_anterior || '|' || coalesce(new.empresa_id::text, '') || '|' || new.tabla || '|' ||
+      coalesce(new.registro_id, '') || '|' || new.accion || '|' || coalesce(new.antes::text, '') || '|' ||
+      coalesce(new.despues::text, '') || '|' || coalesce(new.usuario_id::text, '') || '|' ||
+      to_char(new.fecha at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US'), 'sha256'), 'hex');
+  return new;
+end $$;
+
+
+-- >>>>>>>>>>>>>>>>>>>>>>>> 20261012001400_auditoria.sql
+-- =============================================================================
+-- Planilla Costa Rica · 0014 Correcciones de la auditoría (12/10/2026)
+-- =============================================================================
+
+-- 1. Comisiones con pagos parciales.
+-- La llave única (socio, empresa, concepto, periodo) hacía que, si un cliente pagaba un mes
+-- en dos partes, solo la primera generara comisión: el socio cobraba de menos.
+-- Ahora la idempotencia es por pago: cada abono genera su parte (y volver a calcular no duplica).
+alter table public.comisiones drop constraint if exists comisiones_socio_id_empresa_id_concepto_periodo_key;
+create unique index if not exists comisiones_por_pago on public.comisiones
+  (socio_id, empresa_id, concepto, periodo, coalesce(pago_id, '00000000-0000-0000-0000-000000000000'::uuid));
+
+-- 2. Inicio del módulo Planilla para clientes que pagan desde antes de existir la empresa en el sistema
+-- (p. ej. los clientes de Odoo): el cobro mira los módulos activos en cada mes, así que el primer
+-- periodo de Planilla debe empezar en la fecha de alta del cliente si esta es anterior.
+update public.empresa_modulos m
+   set desde = c.alta
+  from negocio.clientes c
+ where c.empresa_id = m.empresa_id and m.modulo = 'planilla' and c.alta < m.desde
+   and m.desde = (select min(x.desde) from public.empresa_modulos x where x.empresa_id = m.empresa_id and x.modulo = 'planilla');
+
+-- La misma alineación al crear o editar la ficha del cliente (solo la plataforma).
+create or replace function public.alinear_inicio_planilla(p_empresa uuid, p_alta date) returns void
+language plpgsql security definer set search_path = public as $$
+begin
+  if not public.es_admin_plataforma() then raise exception 'Solo la administración de A.U.R.O.M.'; end if;
+  update empresa_modulos m set desde = p_alta
+   where m.empresa_id = p_empresa and m.modulo = 'planilla' and m.desde > p_alta
+     and m.desde = (select min(x.desde) from empresa_modulos x where x.empresa_id = m.empresa_id and x.modulo = 'planilla');
+end $$;
+revoke execute on function public.alinear_inicio_planilla(uuid, date) from public, anon;
+grant execute on function public.alinear_inicio_planilla(uuid, date) to authenticated;
+
+-- 3. Índices para todas las llaves foráneas que no tenían uno.
+-- Sin índice, filtrar por empresa_id (lo hace cada política RLS), borrar en cascada o buscar por
+-- empleado recorre la tabla completa; con miles de boletas y asientos se vuelve lento.
+do $$
+declare r record; v_nombre text;
+begin
+  for r in
+    select c.conrelid, c.conrelid::regclass::text as tabla, n.nspname,
+           string_agg(quote_ident(a.attname), ', ' order by k.ord) as cols,
+           string_agg(a.attname, '_' order by k.ord) as nombres
+      from pg_constraint c
+      join pg_namespace n on n.oid = c.connamespace
+      cross join lateral unnest(c.conkey) with ordinality as k(attnum, ord)
+      join pg_attribute a on a.attrelid = c.conrelid and a.attnum = k.attnum
+     where c.contype = 'f' and n.nspname in ('public', 'negocio', 'contabilidad')
+       and not exists (select 1 from pg_index i
+                        where i.indrelid = c.conrelid
+                          and (i.indkey::int2[])[0:array_length(c.conkey, 1) - 1] @> c.conkey)
+     group by c.conrelid, c.oid, n.nspname
+  loop
+    v_nombre := left(replace(r.tabla, '.', '_') || '_' || r.nombres, 50) || '_fk_' || substr(md5(r.tabla || r.cols), 1, 6);
+    execute format('create index if not exists %I on %s (%s)', v_nombre, r.tabla, r.cols);
+  end loop;
+end $$;
+
+
+commit;
+
+-- Verificación: debe decir "Instalación completa" con 4 valores en true.
+select 'Instalación completa' as resultado,
+       to_regclass('public.empresas') is not null as base,
+       to_regclass('public.idempotencia') is not null as seguridad,
+       to_regclass('public.modulos') is not null as contabilidad,
+       to_regclass('public.comisiones_por_pago') is not null as auditoria;

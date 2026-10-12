@@ -16,7 +16,9 @@ class Settings:
     # Supabase Auth: proyecto nuevo -> JWKS (ES256/RS256); proyecto viejo -> secreto HS256.
     supabase_url: str = os.environ.get("SUPABASE_URL", "")
     supabase_jwt_secret: str = os.environ.get("SUPABASE_JWT_SECRET", "")
-    supabase_service_key: str = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")  # solo para invitar usuarios
+    # Llave de administración, solo para invitar usuarios. Recomendada: la "secret key" nueva (sb_secret_...).
+    # Se acepta también la service_role antigua (JWT), que Supabase retira a fines de 2026.
+    supabase_service_key: str = os.environ.get("SUPABASE_SECRET_KEY", "") or os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
     jwt_audience: str = os.environ.get("JWT_AUDIENCE", "authenticated")
     cors_origins: list[str] = field(default_factory=lambda: _lista("CORS_ORIGINS", "http://localhost:3000"))
     app_url: str = os.environ.get("APP_URL", "http://localhost:3000")
@@ -61,3 +63,15 @@ class Settings:
 
 
 settings = Settings()
+
+
+def cabeceras_admin_supabase() -> dict[str, str]:
+    """Cabeceras para la API de administración de Supabase Auth (invitaciones).
+
+    La llave nueva (sb_secret_...) va solo en `apikey`: no es un JWT y Supabase pide no enviarla en
+    `Authorization: Bearer`. La service_role antigua es un JWT y se envía en ambas, como siempre.
+    """
+    llave = settings.supabase_service_key
+    if llave.startswith("sb_secret_"):
+        return {"apikey": llave}
+    return {"apikey": llave, "Authorization": f"Bearer {llave}"}

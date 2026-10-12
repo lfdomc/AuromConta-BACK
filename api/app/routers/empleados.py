@@ -20,6 +20,21 @@ from ..esquemas import (
 )
 from ..fechas import hoy_cr
 
+NOMBRE_FRECUENCIA = {"monthly": "mensual", "biweekly": "quincenal", "weekly": "semanal", "bimonthly": "bimensual"}
+
+
+def _validar_calendario(ctx: Contexto, calendario_id, frecuencia: str | None) -> None:
+    """El calendario de pago decide la frecuencia de la planilla: debe coincidir con la del colaborador,
+    o la planilla calcularía con otra frecuencia (p. ej. salario mensual en una quincena)."""
+    if not calendario_id or not frecuencia:
+        return
+    cal = crud.obtener(ctx.conn, "calendarios_pago", calendario_id, ctx.empresa_id)
+    if cal["frecuencia"] != frecuencia:
+        raise HTTPException(422, f"El calendario «{cal['nombre']}» es {NOMBRE_FRECUENCIA[cal['frecuencia']]} y la "
+                                 f"frecuencia del colaborador es {NOMBRE_FRECUENCIA[frecuencia]}. Elija un calendario "
+                                 "de la misma frecuencia o déjelo sin calendario.")
+
+
 r = APIRouter(prefix="/empresas/{empresa_id}/empleados", tags=["empleados"], dependencies=[Depends(requiere_modulo("planilla"))])
 
 
@@ -40,6 +55,7 @@ def listar(ctx: Contexto = Depends(contexto_empresa), estado: str | None = "acti
 
 @r.post("", status_code=201)
 def crear(datos: EmpleadoIn, ctx: Contexto = Depends(operador)) -> dict:
+    _validar_calendario(ctx, datos.calendario_id, datos.frecuencia)
     try:
         emp = crud.insertar(ctx.conn, "empleados", {**datos.model_dump(), "empresa_id": ctx.empresa_id})
     except psycopg.errors.UniqueViolation as exc:
@@ -62,7 +78,12 @@ def ver(id: UUID, ctx: Contexto = Depends(contexto_empresa)) -> dict:
 
 @r.patch("/{id}")
 def editar(id: UUID, datos: EmpleadoUpd, ctx: Contexto = Depends(operador)) -> dict:
-    fila = crud.actualizar(ctx.conn, "empleados", id, datos.model_dump(exclude_unset=True), ctx.empresa_id)
+    cambios = datos.model_dump(exclude_unset=True)
+    if "calendario_id" in cambios or "frecuencia" in cambios:
+        actual = crud.obtener(ctx.conn, "empleados", id, ctx.empresa_id)
+        _validar_calendario(ctx, cambios.get("calendario_id", actual["calendario_id"]),
+                            cambios.get("frecuencia") or actual["frecuencia"])
+    fila = crud.actualizar(ctx.conn, "empleados", id, cambios, ctx.empresa_id)
     if not fila:
         raise HTTPException(404, "No encontrado")
     return fila

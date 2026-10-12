@@ -154,7 +154,7 @@ def calcular_boleta(e: EntradaBoleta, p: ParametrosLegales | None = None) -> Res
     if emp.aplica_rop and res.bruto > 0:
         res.rop_obrero = r2(res.bruto * p.rop_obrero)
         res.rop_patronal = r2(res.bruto * p.rop_patronal)
-        lineas.append(Linea("deduccion", Categoria.ROP, res.rop_obrero, "ROP obrero 1 %"))
+        lineas.append(Linea("deduccion", Categoria.ROP, res.rop_obrero, "Aporte adicional de pensión 1 %"))
 
     def _cat(cat):
         return suma(l.monto for l in lineas if l.categoria == cat)

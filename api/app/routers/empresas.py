@@ -15,7 +15,7 @@ from ..auth import (
     contexto_empresa,
     usuario_actual,
 )
-from ..config import settings
+from ..config import cabeceras_admin_supabase, settings
 from ..db import Conexion
 from ..esquemas import (
     AsignacionIn,
@@ -132,8 +132,7 @@ def agregar_usuario(datos: UsuarioEmpresaIn, ctx: Contexto = Depends(admin_empre
         raise HTTPException(409, "El correo no tiene cuenta y las invitaciones no están configuradas")
     # Invitación por la API de administración de Supabase Auth (única acción con llave de servicio).
     resp = httpx.post(f"{settings.supabase_url}/auth/v1/invite",
-                      headers={"apikey": settings.supabase_service_key,
-                               "Authorization": f"Bearer {settings.supabase_service_key}"},
+                      headers=cabeceras_admin_supabase(),
                       json={"email": datos.correo, "data": {"empresa_id": str(ctx.empresa_id), "rol": datos.rol},
                             "redirect_to": f"{settings.app_url}/auth/callback"}, timeout=20)
     if resp.status_code >= 300:

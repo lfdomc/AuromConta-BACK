@@ -83,3 +83,14 @@ def test_respuesta_de_odoo_con_tope_de_tamano(monkeypatch):
         assert e.value.status_code == 413
     finally:
         srv.shutdown()
+
+
+def test_llave_secreta_nueva_de_supabase_solo_en_apikey(monkeypatch):
+    """La secret key (sb_secret_) no es un JWT: va solo en apikey. La service_role antigua, en ambas."""
+    import dataclasses
+
+    from app import config
+    monkeypatch.setattr(config, "settings", dataclasses.replace(config.settings, supabase_service_key="sb_secret_abc"))
+    assert config.cabeceras_admin_supabase() == {"apikey": "sb_secret_abc"}
+    monkeypatch.setattr(config, "settings", dataclasses.replace(config.settings, supabase_service_key="eyJhbGciOi.x.y"))
+    assert config.cabeceras_admin_supabase() == {"apikey": "eyJhbGciOi.x.y", "Authorization": "Bearer eyJhbGciOi.x.y"}

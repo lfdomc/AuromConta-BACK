@@ -189,3 +189,20 @@ def test_yo_muestra_empleos_del_portal(client, usuarios, empresa, empleados, dsn
         c.execute("update empleados set usuario_id = %s where id = %s", (usuarios["empleado"]["id"], empleados["ana"]))
     yo = client.get("/yo", headers=usuarios["empleado"]["h"]).json()
     assert [e["empresa"] for e in yo["empleos"]] == ["Constructora Prueba SA"]
+
+
+def test_periodo_y_calendario_coherentes(client, usuarios, empresa, empleados):
+    """Caso real: calendario mensual con colaborador quincenal y planilla del 1 al 15 pagó el salario
+    de un mes prorrateado. Ahora ambas combinaciones se rechazan con un mensaje claro."""
+    op, adm = usuarios["operador"]["h"], usuarios["admin"]["h"]
+    r = client.post(f"/empresas/{empresa}/planillas", json={"frecuencia": "monthly", "desde": "2026-04-01",
+                                                            "hasta": "2026-04-15"}, headers=op)
+    assert r.status_code == 422 and "mensual" in r.json()["detail"]
+    r = client.post(f"/empresas/{empresa}/planillas", json={"tipo": "extraordinaria", "frecuencia": "monthly",
+                                                            "desde": "2026-04-01", "hasta": "2026-04-15"}, headers=op)
+    assert r.status_code == 201, r.text
+    cal = client.post(f"/empresas/{empresa}/calendarios", json={"nombre": "Mensual", "frecuencia": "monthly"}, headers=adm)
+    assert cal.status_code == 201, cal.text
+    r = client.patch(f"/empresas/{empresa}/empleados/{empleados['ana']}", json={"calendario_id": cal.json()["id"]},
+                     headers=op)
+    assert r.status_code == 422 and "quincenal" in r.json()["detail"]

@@ -27,6 +27,21 @@ def _bloquear(ctx: Contexto, id: UUID) -> dict:
     return pl
 
 
+# Días que puede abarcar una planilla ordinaria según su frecuencia.
+DIAS_FRECUENCIA = {"monthly": (28, 31), "biweekly": (13, 16), "weekly": (7, 7), "bimonthly": (59, 62)}
+NOMBRE_FRECUENCIA = {"monthly": "mensual", "biweekly": "quincenal", "weekly": "semanal", "bimonthly": "bimensual"}
+
+
+def _validar_periodo(frecuencia: str, desde, hasta) -> None:
+    """Evita, p. ej., una planilla mensual del 1 al 15: pagaría el salario de un mes en media quincena."""
+    dias = (hasta - desde).days + 1
+    minimo, maximo = DIAS_FRECUENCIA[frecuencia]
+    if not minimo <= dias <= maximo:
+        rango = f"{minimo}" if minimo == maximo else f"entre {minimo} y {maximo}"
+        raise HTTPException(422, f"Una planilla {NOMBRE_FRECUENCIA[frecuencia]} abarca {rango} días y este periodo "
+                                 f"tiene {dias}. Revise las fechas o el calendario elegido.")
+
+
 def _error_db(exc: Exception) -> HTTPException:
     msg = getattr(getattr(exc, "diag", None), "message_primary", None) or str(exc)
     return HTTPException(409, msg)
@@ -53,6 +68,8 @@ def crear(datos: PlanillaIn, ctx: Contexto = Depends(operador)) -> dict:
     if datos.calendario_id:
         cal = crud.obtener(ctx.conn, "calendarios_pago", datos.calendario_id, ctx.empresa_id)
         d["frecuencia"] = cal["frecuencia"]
+    if d["tipo"] == "ordinaria":
+        _validar_periodo(d["frecuencia"], d["desde"], d["hasta"])
     dup = ctx.conn.execute("""select id from planillas where empresa_id = %s and tipo = %s and desde = %s and hasta = %s
                               and calendario_id is not distinct from %s and sucursal_id is not distinct from %s""",
                            (ctx.empresa_id, d["tipo"], d["desde"], d["hasta"], d["calendario_id"], d["sucursal_id"])).fetchone()
