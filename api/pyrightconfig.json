@@ -1,0 +1,6 @@
+{
+  "include": ["app"],
+  "extraPaths": ["../motor/src"],
+  "pythonVersion": "3.11",
+  "typeCheckingMode": "basic"
+}
