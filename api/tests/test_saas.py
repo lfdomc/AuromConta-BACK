@@ -209,6 +209,8 @@ def test_pasar_de_prueba_a_cobro(client, usuarios, dsn):
     assert e.status_code == 201, e.text
     eid = e.json()["id"]
     assert client.get(f"/plataforma/empresas/{eid}", headers=d).json()["estado_servicio"] == "prueba"
+    # El registro ya no crea un calendario de pago (la frecuencia es de cada colaborador)
+    assert client.get(f"/empresas/{eid}/calendarios", headers=j).json() == []
     # Sin cédula ni correo no se puede cobrar: mensaje claro
     r = client.patch(f"/plataforma/empresas/{eid}", json={"estado_servicio": "activo"}, headers=d)
     assert r.status_code == 200 and r.json()["cliente"] is None and "cédula" in r.json()["aviso_cobro"]
