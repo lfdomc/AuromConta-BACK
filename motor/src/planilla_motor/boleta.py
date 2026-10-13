@@ -108,20 +108,49 @@ def calcular_boleta(e: EntradaBoleta, p: ParametrosLegales | None = None) -> Res
     res.base_cotizable = g
 
     # 6a. CCSS con piso BMC ---------------------------------------------------
+    # Reglamento del Seguro de Salud art. 63 y Reglamento del IVM arts. 2 y 34 (CCSS, sesión 9275,
+    # La Gaceta 7/9/2022): en jornada parcial con salario menor a la BMC se cotiza sobre una BMC
+    # reducida (50 %). Desde el 1/1/2025 aplica a todas las edades (antes: < 35 y < 50 años).
     bmc_mes = cfg.bmc_monto or p.bmc_mensual
     bmc_periodo = r2(bmc_mes * ff)
-    reducida = bool(emp.medio_tiempo and emp.fecha_nacimiento
-                    and _edad(emp.fecha_nacimiento, per.desde) < p.edad_limite_bmc_reducida)
+    limite = p.edad_limite_bmc_reducida
+    reducida = bool(emp.medio_tiempo and (not limite or (
+        emp.fecha_nacimiento and _edad(emp.fecha_nacimiento, per.desde) < limite)))
+    aplica_piso = (cfg.aplicar_bmc and not inc.hay_incapacidad and lic_sg <= 0
+                   and not emp.exento and g > 0)
+    piso_sem = r2(bmc_periodo / 2) if reducida else bmc_periodo
+    if p.bmc_ivm_mensual is not None:
+        bmc_ivm_mes = D(p.bmc_ivm_mensual)
+        if reducida:
+            # Cuota parcial del IVM: 25, 50, 75 o 100 % de la BMC reducida, la más próxima al salario.
+            g_mes = g / ff if ff else g
+            refs = [r2(bmc_ivm_mes / 2 * k) for k in (D("0.25"), D("0.5"), D("0.75"), D("1"))]
+            bmc_ivm_mes = min(refs, key=lambda x: (abs(x - g_mes), -x))
+        piso_ivm = r2(bmc_ivm_mes * ff)
+    else:
+        piso_ivm = piso_sem
     base_ccss = g
-    if (cfg.aplicar_bmc and not reducida and not inc.hay_incapacidad
-            and lic_sg <= 0 and not emp.exento and g > 0 and g < bmc_periodo):
-        base_ccss = bmc_periodo
+    if aplica_piso and g < piso_sem:
+        base_ccss = piso_sem
         res.bmc_aplicada = True
     res.base_ccss = base_ccss
     res.bmc_reducida = reducida and g < bmc_periodo
 
     tasa_obr = p.ccss_obrero_pensionado_estado if emp.pensionado == "estado" else p.ccss_obrero
-    res.ccss_obrero = CERO if emp.exento else r2(base_ccss * tasa_obr)
+    por_regimen = (aplica_piso and emp.pensionado != "estado" and None not in (
+        p.bmc_ivm_mensual, p.ccss_sem_obrero, p.ccss_ivm_obrero, p.ccss_sem_patronal, p.ccss_ivm_patronal))
+    if por_regimen:
+        # La BMC solo sube las cuotas del SEM y del IVM; lo demás se cobra sobre el salario real.
+        falta_sem = max(piso_sem - g, CERO)
+        falta_ivm = max(piso_ivm - g, CERO)
+        if falta_ivm > 0:
+            res.bmc_aplicada = True
+        extra_obr = falta_sem * p.ccss_sem_obrero + falta_ivm * p.ccss_ivm_obrero
+        extra_pat = falta_sem * p.ccss_sem_patronal + falta_ivm * p.ccss_ivm_patronal
+        res.ccss_obrero = CERO if emp.exento else r2(g * tasa_obr + extra_obr)
+    else:
+        extra_pat = None
+        res.ccss_obrero = CERO if emp.exento else r2(base_ccss * tasa_obr)
 
     if e.dias_paternidad > 0:
         # Diario = salario mensual / 30. Diferencia con Odoo (hallazgo H4):
@@ -143,7 +172,7 @@ def calcular_boleta(e: EntradaBoleta, p: ParametrosLegales | None = None) -> Res
 
     # 6c. Cargas patronales ---------------------------------------------------
     if not emp.exento:
-        res.ccss_patronal = r2(base_ccss * p.ccss_patronal)
+        res.ccss_patronal = r2(g * p.ccss_patronal + extra_pat) if extra_pat is not None else r2(base_ccss * p.ccss_patronal)
         tasa_ins = p.ins_tasas.get(emp.clase_riesgo_ins or p.ins_clase_defecto,
                                    p.ins_tasas[p.ins_clase_defecto])
         res.ins_patronal = r2(g * tasa_ins)

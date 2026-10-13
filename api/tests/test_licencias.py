@@ -88,3 +88,21 @@ def test_reporte_208_138(client, e):
     x = client.get(f"/empresas/{eid}/reportes/retenciones-208", params={"desde": "2026-03-01", "hasta": "2026-03-31",
                    "formato": "xlsx"}, headers=h)
     assert x.status_code == 200 and x.content[:2] == b"PK"
+
+
+def test_lactancia_ley_10895(client, e):
+    h, eid = e["h"], e["id"]
+    url = f"/empresas/{eid}/permisos"
+    base = {"empleado_id": e["duelo"], "tipo": "lactancia", "fecha_evento": "2026-01-10", "dias": "30"}
+    # Dentro del primer año: sin certificado
+    ok = client.post(url, json={**base, "desde": "2026-03-01", "hasta": "2026-12-31", "horas": "1"}, headers=h)
+    assert ok.status_code == 201, ok.text
+    assert ok.json()["con_goce"] is True and ok.json()["unidad"] == "horas"
+    # Después del primer año: pide certificado; cada certificado cubre tres meses
+    sin_cert = client.post(url, json={**base, "desde": "2027-01-11", "hasta": "2027-04-10", "horas": "2"}, headers=h)
+    assert sin_cert.status_code == 422 and "certificado" in sin_cert.text
+    largo = client.post(url, json={**base, "desde": "2027-01-11", "hasta": "2027-08-10", "horas": "2",
+                                   "numero_documento": "CM-1"}, headers=h)
+    assert largo.status_code == 422 and "tres meses" in largo.text
+    assert client.post(url, json={**base, "desde": "2027-01-11", "hasta": "2027-04-10", "horas": "2",
+                                  "numero_documento": "CM-1"}, headers=h).status_code == 201

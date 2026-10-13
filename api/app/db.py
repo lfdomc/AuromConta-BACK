@@ -30,7 +30,8 @@ _pool: ConnectionPool | None = None
 def pool() -> ConnectionPool:
     global _pool
     if _pool is None:
-        _pool = ConnectionPool(settings.database_url, min_size=1, max_size=10, open=True,
+        _pool = ConnectionPool(settings.database_url, min_size=settings.db_pool_min, max_size=settings.db_pool_max,
+                               max_idle=300, timeout=15, open=True,
                                kwargs={"row_factory": dict_row, "autocommit": False,
                                        "prepare_threshold": None})  # compatible con el pooler de Supabase
     return _pool
@@ -50,20 +51,22 @@ def como_usuario(claims: dict[str, Any]) -> Iterator[Conexion]:
     with pool().connection() as c:
         conn = cast(Conexion, c)
         try:
-            # current_date, now()::date y los valores por defecto de fecha se calculan en hora de Costa Rica.
-            conn.execute("select set_config('timezone', 'America/Costa_Rica', true)")
-            conn.execute("set local role authenticated")
-            conn.execute("select set_config('request.jwt.claims', %s, true)", (json.dumps(claims),))
-            conn.execute("select set_config('request.jwt.claim.sub', %s, true)", (claims.get("sub", ""),))
-            # Marca de que la escritura viene de la API (ver migración 0010: PostgREST no puede fijarla).
-            conn.execute("select set_config('aurom.via_api', 'si', true)")
-            # MFA obligatoria en acciones críticas (la base la verifica con el claim aal, migración 0011).
-            if settings.mfa_obligatoria:
-                conn.execute("select set_config('aurom.mfa_requerida', 'si', true)")
-            # Ninguna consulta de usuario puede bloquear la base: límites por transacción.
-            conn.execute("select set_config('statement_timeout', %s, true)", (f"{settings.db_statement_timeout_ms}ms",))
-            conn.execute("select set_config('lock_timeout', '5s', true)")
-            conn.execute("select set_config('idle_in_transaction_session_timeout', '60s', true)")
+            # Todo en una sola ida y vuelta a la base (antes eran 8 comandos por petición):
+            # - zona horaria de Costa Rica para current_date y fechas por defecto;
+            # - rol authenticated + claims del JWT, para que RLS se aplique como al usuario;
+            # - marca de que la escritura viene de la API (migración 0010) y MFA obligatoria (0011);
+            # - límites por transacción: ninguna consulta de usuario puede bloquear la base.
+            conn.execute("""select set_config('timezone', 'America/Costa_Rica', true),
+                                   set_config('role', 'authenticated', true),
+                                   set_config('request.jwt.claims', %s, true),
+                                   set_config('request.jwt.claim.sub', %s, true),
+                                   set_config('aurom.via_api', 'si', true),
+                                   set_config('aurom.mfa_requerida', %s, true),
+                                   set_config('statement_timeout', %s, true),
+                                   set_config('lock_timeout', '5s', true),
+                                   set_config('idle_in_transaction_session_timeout', '60s', true)""",
+                         (json.dumps(claims), claims.get("sub", ""), "si" if settings.mfa_obligatoria else "",
+                          f"{settings.db_statement_timeout_ms}ms"))
             yield conn
             conn.commit()
         except Exception:

@@ -392,3 +392,38 @@ def test_cron_diario(client, m, usuarios, dsn, http):
     r2 = client.post("/cron/diario", params={"fecha": hoy.isoformat()}, headers=h).json()
     assert r2["avisos_omitidos"] and r2["cambios_salariales"] == []
     assert D(client.get(f"/empresas/{m['ea']}/empleados/{eid}", headers=op).json()["saldo_vacaciones"]) == D("3") + esperado
+
+
+# ------------------------------------------------- límites de las tareas ----
+def test_tareas_con_limites(client, ajustes, http, dsn):
+    """Intervalo mínimo, una sola ejecución a la vez y tope diario (servicios/tareas.py)."""
+    from app.servicios import tareas
+    h = {"X-Cron-Secret": SECRETO_CRON}
+    object.__setattr__(ajustes, "cron_limites", True)
+    try:
+        with psycopg.connect(dsn, autocommit=True) as c:
+            c.execute("delete from negocio.ejecuciones_cron")
+        primera = client.post("/cron/salud", headers=h).json()
+        assert "servicios" in primera
+        segunda = client.post("/cron/salud", headers=h).json()
+        assert segunda["omitida"] and "minutos" in segunda["motivo"]
+        # Una corrida en curso bloquea otra igual (p. ej. dos cobros a la vez)
+        with psycopg.connect(dsn, autocommit=True) as c:
+            c.execute("insert into negocio.ejecuciones_cron (tarea) values ('cobros')")
+        r = client.post("/cron/cobros", params={"fecha": "2026-12-01"}, headers=h).json()
+        assert r["omitida"] and "en curso" in r["motivo"]
+        # Si quedó colgada más de una hora, se libera sola
+        with psycopg.connect(dsn, autocommit=True) as c:
+            c.execute("update negocio.ejecuciones_cron set inicio = now() - interval '2 hours' where tarea = 'cobros'")
+        assert "omitida" not in client.post("/cron/cobros", params={"fecha": "2026-12-01"}, headers=h).json()
+        with psycopg.connect(dsn, autocommit=True) as c:
+            estados = [x[0] for x in c.execute("select estado from negocio.ejecuciones_cron where tarea = 'cobros' order by id")]
+        assert estados == ["abandonada", "ok"]
+        # Tope diario: ni los reprocesos con fecha pasan de él
+        with psycopg.connect(dsn, autocommit=True) as c:
+            c.execute("""insert into negocio.ejecuciones_cron (tarea, estado, fin)
+                         select 'cobros', 'ok', now() from generate_series(1, %s)""", (tareas.LIMITES["cobros"].tope_diario,))
+        r = client.post("/cron/cobros", params={"fecha": "2026-12-02"}, headers=h).json()
+        assert r["omitida"] and "tope" in r["motivo"]
+    finally:
+        object.__setattr__(ajustes, "cron_limites", False)

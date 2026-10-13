@@ -12,7 +12,7 @@ from .. import crud
 from ..auth import Contexto, aprobador, contexto_empresa, operador, requiere_modulo
 from ..esquemas import AguinaldoIn, LiquidacionIn
 from ..fechas import hoy_cr
-from ..servicios import marca, pdf
+from ..servicios import citas_legales, marca, pdf
 
 r = APIRouter(prefix="/empresas/{empresa_id}", tags=["anuales"], dependencies=[Depends(requiere_modulo("planilla"))])
 
@@ -204,9 +204,10 @@ def liquidacion_pdf(id: UUID, ctx: Contexto = Depends(contexto_empresa)) -> Resp
                    ["Antigüedad", f"{res['anios']} años, {res['meses']} meses, {res['dias']} días"],
                    ["Salario promedio (6 meses)", c(res["salario_promedio_mensual"])],
                    ["Salario diario", c(res["salario_diario"])]]),
-        ("Derechos", [["Concepto", "Monto"], [f"Preaviso ({res['dias_preaviso']} días)", c(res["preaviso"])],
-                      [f"Cesantía ({res['dias_cesantia']} días)", c(res["cesantia"])],
-                      ["Vacaciones pendientes", c(res["vacaciones"])], ["Aguinaldo proporcional", c(res["aguinaldo"])],
+        ("Derechos", [["Concepto", "Monto"], [f"Preaviso ({res['dias_preaviso']} días) · Art. 28 CT", c(res["preaviso"])],
+                      [f"Cesantía ({res['dias_cesantia']} días) · Art. 29 CT", c(res["cesantia"])],
+                      ["Vacaciones pendientes · Arts. 153 y 156 CT", c(res["vacaciones"])],
+                      ["Aguinaldo proporcional · Ley 2412", c(res["aguinaldo"])],
                       ["Salarios pendientes", c(res["salarios_pendientes"])], ["Otros pagos", c(res["otros_pagos"])],
                       ["Total derechos", c(res["total_bruto"])]]),
         ("Deducciones", [["Concepto", "Monto"], ["CCSS obrero (vacaciones y salarios)", c(res["ccss_obrero"])],
@@ -214,7 +215,9 @@ def liquidacion_pdf(id: UUID, ctx: Contexto = Depends(contexto_empresa)) -> Resp
                          ["Total deducciones", c(res["deducciones"])]]),
         ("", [["Concepto", "Monto"], ["Total a pagar", c(res["total"])]]),
     ]
-    pie = " ".join(res.get("notas", [])) + "  Recibí conforme: ______________________   Fecha: ____________"
+    pie = (" ".join(res.get("notas", [])) + " "
+           + citas_legales.texto(["preaviso", "cesantia", "vacaciones", "aguinaldo", "ccss_cuotas"])
+           + "  Recibí conforme: ______________________   Fecha: ____________")
     contenido = pdf.documento_simple(f"Liquidación laboral · {emp['nombre']}",
                                      f"Cédula jurídica {emp['cedula_juridica'] or '—'} · Código de Trabajo Arts. 28-31",
                                      secciones, pie, logo=marca.logo(ctx.conn, ctx.empresa_id))

@@ -43,7 +43,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from .. import crud
 from ..auth import Contexto, contexto_empresa, operador, requiere_modulo
 from ..fechas import hoy_cr
-from ..servicios import marca, pdf
+from ..servicios import citas_legales, marca, pdf
 from ..servicios.excel_seguro import texto_csv
 
 r = APIRouter(prefix="/empresas/{empresa_id}", tags=["reportes"], dependencies=[Depends(requiere_modulo("planilla"))])
@@ -745,6 +745,9 @@ def generar_reporte(tipo: str, desde: date | None = None, hasta: date | None = N
         raise HTTPException(404, f"Reporte desconocido: {tipo}")
     f = filtros(desde, hasta, planilla_id, sucursal_id, empleado_id)
     rep = REPORTES[tipo][3](ctx, f)
+    cita = citas_legales.de_reporte(tipo)
+    if cita:
+        rep["notas"] = [*rep.get("notas", []), cita]
     return entregar(rep, formato, f"{tipo}-{f.desde}-{f.hasta}", ctx)
 
 

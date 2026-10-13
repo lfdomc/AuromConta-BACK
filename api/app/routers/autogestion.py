@@ -43,7 +43,7 @@ from ..auth import (
 from ..config import settings
 from ..db import Conexion
 from ..fechas import hoy_cr
-from ..servicios import alertas, correo, telegram
+from ..servicios import alertas, correo, tareas, telegram
 from ..servicios.telegram import esc
 from .saas import _vigente_json, insertar_parametros, validar_parametros
 
@@ -750,17 +750,23 @@ def rechazar_normativa(id: UUID, datos: RechazarIn | None = None, conn: Conexion
 
 # ================================================================== Salud ====
 @plataforma.get("/salud", summary="Estado de los servicios y su historial")
-def salud(conn: Conexion = Depends(admin_plataforma), horas: int = Query(24, ge=1, le=24 * 30)) -> dict:
+def salud(conn: Conexion = Depends(admin_plataforma), horas: int = Query(24, ge=1, le=24 * 30),
+          con_historial: bool = Query(False, description="Incluir cada chequeo (hasta 2 000 filas)")) -> dict:
     ultimos = conn.execute("""select distinct on (servicio) * from negocio.chequeos_salud
                                order by servicio, fecha desc""").fetchall()
     historial = conn.execute("""select * from negocio.chequeos_salud where fecha > now() - make_interval(hours => %s)
-                                 order by fecha desc limit 2000""", (horas,)).fetchall()
+                                 order by fecha desc limit 2000""", (horas,)).fetchall() if con_historial else []
+    # Tareas programadas: última corrida de cada una y cuántas hubo en 24 h (servicios/tareas.py).
+    tareas_cron = conn.execute("""select distinct on (tarea) tarea, inicio, fin, estado, duracion_ms, detalle,
+                                         (select count(*)::int from negocio.ejecuciones_cron x
+                                           where x.tarea = e.tarea and x.inicio > now() - interval '24 hours') as en_24h
+                                    from negocio.ejecuciones_cron e order by tarea, inicio desc""").fetchall()
     disponibilidad = conn.execute("""select servicio, round(100.0 * avg(ok::int), 2) as porcentaje,
                                             round(avg(latencia_ms)) as latencia_promedio_ms
                                        from negocio.chequeos_salud where fecha > now() - make_interval(hours => %s)
                                       group by servicio""", (horas,)).fetchall()
     return {"ok": all(u["ok"] for u in ultimos) if ultimos else None, "servicios": ultimos,
-            "disponibilidad": disponibilidad, "historial": historial}
+            "disponibilidad": disponibilidad, "historial": historial, "tareas": tareas_cron}
 
 
 def cron_autorizado(x_cron_secret: str = Header(default="")) -> None:
@@ -806,8 +812,12 @@ def chequear_servicios(conn: Conexion) -> list[dict]:
     return resultados
 
 
-@cron.post("/salud", dependencies=[Depends(cron_autorizado)], summary="Chequeo de servicios (cada 5-15 min)")
+@cron.post("/salud", dependencies=[Depends(cron_autorizado)], summary="Chequeo de servicios (cada hora)")
 def cron_salud() -> dict:
+    return tareas.ejecutar("salud", _cron_salud)
+
+
+def _cron_salud() -> dict:
     with db.sistema() as conn:
         resultados = chequear_servicios(conn)
         for res in resultados:
@@ -1071,6 +1081,17 @@ def avisos_empresas(conn, hoy: date) -> dict[Any, list[str]]:
         estado = (f"venció el {f['vence']:%d/%m/%Y}" if dias < 0 else "vence hoy" if dias == 0
                   else f"vence el {f['vence']:%d/%m/%Y} ({dias} días)")
         add(f["empresa_id"], f"📄 {f['tipo']} de {_nombre(f)}" + (f" ({f['numero']})" if f["numero"] else "") + f" {estado}.")
+    # Licencia de lactancia por terminar (Ley 10895): a 15 días y el último día, para pedir el certificado de prórroga.
+    for f in conn.execute(sql.SQL("""
+        select x.empresa_id, x.hasta, e.nombre, e.apellidos from permisos x
+          join empleados e on e.id = x.empleado_id and e.estado = 'activo'
+          join empresas em on em.id = x.empresa_id
+         where x.tipo = 'lactancia' and x.estado = 'aprobado' and {activas} and (x.hasta - %s) in (0, 15)
+           and not exists (select 1 from permisos y where y.empleado_id = x.empleado_id and y.tipo = 'lactancia'
+                            and y.estado = 'aprobado' and y.desde > x.hasta)""").format(activas=activas),
+                          (hoy,)).fetchall():
+        add(f["empresa_id"], f"🍼 La licencia de lactancia de {_nombre(f)} termina el {f['hasta']:%d/%m/%Y}. Si continúa, "
+                             "registre la prórroga con su certificado médico (Ley 10895, cada tres meses).")
     # Saldos de vacaciones negativos: los lunes (cron_alert_negative_vacations).
     if hoy.weekday() == 0:
         for f in conn.execute(sql.SQL("""
@@ -1251,9 +1272,31 @@ def _ya_corrio(conn, hoy: date) -> bool:
     return bool(fila and (fila["valor"] or {}).get("fecha") == hoy.isoformat())
 
 
+def limpiar_registros(conn) -> dict:
+    """Borra registros técnicos viejos para que la base no crezca sin control (Supabase cobra por espacio).
+    Nunca toca datos de planilla, contabilidad ni la bitácora de auditoría."""
+    filas = {
+        "chequeos_salud": conn.execute(
+            "delete from negocio.chequeos_salud where fecha < now() - interval '90 days'").rowcount,
+        "eventos_webhook": conn.execute(
+            "delete from negocio.eventos_webhook where procesado_en is not null and recibido_en < now() - interval '400 days'").rowcount,
+        "alertas": conn.execute(
+            "delete from negocio.alertas where atendida and creado_en < now() - interval '400 days'").rowcount,
+        "idempotencia": conn.execute(
+            "delete from public.idempotencia where creado_en < now() - interval '48 hours'").rowcount,
+        "ejecuciones_cron": conn.execute(
+            "delete from negocio.ejecuciones_cron where inicio < now() - interval '90 days'").rowcount,
+    }
+    return {k: v for k, v in filas.items() if v}
+
+
 @cron.post("/diario", dependencies=[Depends(cron_autorizado)], summary="Tareas diarias (7:00 a. m. hora de Costa Rica)")
 def cron_diario(fecha: date | None = Query(None, description="Solo para pruebas o reprocesos; por defecto hoy en Costa Rica"),
                 forzar_avisos: bool = False) -> dict:
+    return tareas.ejecutar("diario", lambda: _cron_diario(fecha, forzar_avisos), reproceso=fecha is not None)
+
+
+def _cron_diario(fecha: date | None, forzar_avisos: bool) -> dict:
     hoy = fecha or hoy_cr()
     resultado: dict[str, Any] = {"fecha": hoy.isoformat(), "errores": []}
     with db.sistema() as conn:
@@ -1273,11 +1316,13 @@ def cron_diario(fecha: date | None = Query(None, description="Solo para pruebas 
         prestamos = tarea("prestamos", cerrar_prestamos, conn) or []
         antiguedad = tarea("bono_antiguedad", bonos_antiguedad, conn, hoy) or []
         prospectos = tarea("prospectos", actualizar_prospectos, conn, hoy) or {}
+        limpieza = tarea("limpieza", limpiar_registros, conn) or {}
         resultado.update({
             "cambios_salariales": [{"empleado_id": c["empleado_id"], "salario_anterior": c["anterior"],
                                     "salario_nuevo": c["salario_nuevo"]} for c in cambios],
             "vacaciones": {"empleados": len(acum), "dias": sum(a["dias"] for a in acum)},
             "prestamos_cerrados": len(prestamos), "prospectos": prospectos, "bonos_antiguedad": len(antiguedad),
+            "limpieza": limpieza,
         })
 
         enviados = {"empresas": 0, "correos": 0, "telegram": 0, "boletas_telegram": 0}
@@ -1339,6 +1384,10 @@ def cron_diario(fecha: date | None = Query(None, description="Solo para pruebas 
 @cron.post("/ancla-auditoria", dependencies=[Depends(cron_autorizado)],
            summary="Verifica la bitácora encadenada y envía su huella fuera de la base (diario)")
 def ancla_auditoria() -> dict:
+    return tareas.ejecutar("ancla-auditoria", _ancla_auditoria)
+
+
+def _ancla_auditoria() -> dict:
     """La huella final de la cadena se manda por Telegram a la dueña: si alguien con acceso
     total a la base reescribiera la bitácora, la huella dejaría de coincidir con las enviadas."""
     with db.sistema() as conn:

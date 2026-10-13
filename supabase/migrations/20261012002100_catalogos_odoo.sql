@@ -96,11 +96,16 @@ create policy gestionar on public.salarios_minimos for all to authenticated
 grant select, insert, update, delete on public.salarios_minimos to authenticated;
 
 insert into public.salarios_minimos (categoria, monto, vigente_desde, decreto) values
-  ('Trabajador no calificado genérico', 384300, '2026-01-01', 'Decreto MTSS salarios mínimos 2026'),
-  ('Trabajador semicalificado', 399400, '2026-01-01', 'Decreto MTSS salarios mínimos 2026'),
-  ('Trabajador calificado', 430500, '2026-01-01', 'Decreto MTSS salarios mínimos 2026'),
-  ('Técnico de nivel medio', 521600, '2026-01-01', 'Decreto MTSS salarios mínimos 2026'),
-  ('Universitario con título', 736900, '2026-01-01', 'Decreto MTSS salarios mínimos 2026')
+  ('Trabajador en ocupación no calificada', 373092.30, '2026-01-01', 'Decreto 45303-MTSS'),
+  ('Trabajador en ocupación semicalificada', 405710.70, '2026-01-01', 'Decreto 45303-MTSS'),
+  ('Trabajador en ocupación calificada', 419755.80, '2026-01-01', 'Decreto 45303-MTSS'),
+  ('Trabajador en ocupación especializada', 487335.00, '2026-01-01', 'Decreto 45303-MTSS'),
+  ('Técnico Medio de Educación Diversificada', 496838.17, '2026-01-01', 'Decreto 45303-MTSS'),
+  ('Técnico de Educación Superior', 542096.58, '2026-01-01', 'Decreto 45303-MTSS'),
+  ('Diplomado de Educación Superior', 585484.58, '2026-01-01', 'Decreto 45303-MTSS'),
+  ('Bachiller universitario', 664078.07, '2026-01-01', 'Decreto 45303-MTSS'),
+  ('Licenciado universitario', 796921.00, '2026-01-01', 'Decreto 45303-MTSS'),
+  ('Trabajo doméstico', 268731.31, '2026-01-01', 'Decreto 45303-MTSS')
 on conflict do nothing;
 
 -- ------------------------------------------------------------ Datos predeterminados por empresa

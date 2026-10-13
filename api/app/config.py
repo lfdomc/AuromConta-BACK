@@ -27,6 +27,8 @@ class Settings:
     correo_remitente: str = os.environ.get("CORREO_REMITENTE", "Planilla Costa Rica <planilla@auromtec.com>")
     # Tareas programadas (pg_cron / Railway cron llaman con este secreto)
     cron_secret: str = os.environ.get("CRON_SECRET", "")
+    # Intervalo mínimo y tope diario de cada tarea (app/servicios/tareas.py). Solo las pruebas lo apagan.
+    cron_limites: bool = os.environ.get("CRON_LIMITES", "si").lower() not in ("no", "0", "false")
     # Telegram
     telegram_bot_token: str = os.environ.get("TELEGRAM_BOT_TOKEN", "")
     telegram_webhook_secret: str = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "")
@@ -55,6 +57,12 @@ class Settings:
     # Llave AES-256 en base64 (32 bytes) para cifrar datos sensibles guardados (tokens de tarjeta).
     clave_cifrado: str = os.environ.get("CLAVE_CIFRADO", "")
     db_statement_timeout_ms: int = int(os.environ.get("DB_STATEMENT_TIMEOUT_MS", "20000"))
+    # Conexiones a Supabase POR PROCESO (uvicorn --workers). Total = workers × DB_POOL_MAX: con 2 workers
+    # y 5, son 10 como máximo, dentro del límite del plan. Las inactivas se cierran a los 5 minutos.
+    # DB_POOL_MIN = 0: sin uso no queda ninguna conexión abierta, así Railway (Serverless) puede dormir
+    # la API; la primera petición después abre una conexión nueva (unos milisegundos más).
+    db_pool_min: int = int(os.environ.get("DB_POOL_MIN", "0"))
+    db_pool_max: int = int(os.environ.get("DB_POOL_MAX", "5"))
     max_cuerpo_bytes: int = int(os.environ.get("MAX_CUERPO_BYTES", str(8 * 1024 * 1024)))
     limite_por_minuto: int = int(os.environ.get("LIMITE_POR_MINUTO", "300"))
     limite_sensible_por_minuto: int = int(os.environ.get("LIMITE_SENSIBLE_POR_MINUTO", "30"))

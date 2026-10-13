@@ -19,6 +19,9 @@ from .modelos import Frecuencia, Incapacidad, TipoIncapacidad
 from .parametros import ParametrosLegales
 
 
+VENTANA_RECAIDA_DIAS = 30
+
+
 @dataclass
 class ResultadoIncapacidad:
     dias: Decimal = CERO
@@ -49,10 +52,20 @@ def calcular_incapacidades(
     validas = sorted(incapacidades, key=lambda i: i.desde)
 
     # Agrupar prorrogas: una incapacidad que empieza a mas tardar el dia
-    # siguiente al fin de la anterior es el mismo evento.
+    # siguiente al fin de la anterior es el mismo evento. Ademas, en enfermedad
+    # CCSS, una nueva incapacidad dentro de los 30 dias posteriores a la anterior
+    # se subsidia desde el primer dia (Reglamento del Seguro de Salud, art. 35):
+    # el patrono no vuelve a pagar los dias 1-3.
+    def _mismo_evento(prev: Incapacidad, inc: Incapacidad) -> bool:
+        if inc.desde <= prev.hasta + timedelta(days=1):
+            return True
+        ccss = (TipoIncapacidad.MATERNIDAD, TipoIncapacidad.INS)
+        return (prev.tipo not in ccss and inc.tipo not in ccss
+                and inc.desde <= prev.hasta + timedelta(days=VENTANA_RECAIDA_DIAS))
+
     grupos: list[list[Incapacidad]] = []
     for inc in validas:
-        if grupos and inc.desde <= grupos[-1][-1].hasta + timedelta(days=1):
+        if grupos and _mismo_evento(grupos[-1][-1], inc):
             grupos[-1].append(inc)
         else:
             grupos.append([inc])

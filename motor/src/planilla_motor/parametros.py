@@ -58,7 +58,16 @@ class ParametrosLegales:
     # Art. 172 CT: menor salario mínimo mensual del decreto vigente (servicio doméstico,
     # Decreto 45303-MTSS para 2026). Hasta ese monto el salario es inembargable.
     salario_minimo_inembargable: Decimal = D("268731.31")
-    edad_limite_bmc_reducida: int = 35
+    # 0 = sin límite de edad (CCSS: desde el 1/1/2025 la BMC reducida aplica a todas las edades)
+    edad_limite_bmc_reducida: int = 0
+    # Base mínima contributiva por régimen (CCSS: la BMC aplica a las cuotas del SEM y del IVM,
+    # no al resto: Banco Popular, FCL, ROP, IMAS, INA, Asignaciones). Si faltan, se usa el modo
+    # anterior: toda la tasa sobre la BMC.
+    bmc_ivm_mensual: Decimal | None = None
+    ccss_sem_obrero: Decimal | None = None
+    ccss_ivm_obrero: Decimal | None = None
+    ccss_sem_patronal: Decimal | None = None
+    ccss_ivm_patronal: Decimal | None = None
 
 
 PARAMETROS_2026 = ParametrosLegales(
@@ -66,10 +75,13 @@ PARAMETROS_2026 = ParametrosLegales(
     ccss_obrero=D("0.1083"),
     ccss_obrero_pensionado_estado=D("0.065"),
     ccss_patronal=D("0.2683"),
-    # Valor del modulo Odoo (planilla_const.CCSS_BMC_MENSUAL). Pendiente de
-    # confirmar con el contador: la CCSS publico para 2026 SEM 346,789 e
-    # IVM 324,590 (bases separadas por regimen).
-    bmc_mensual=D("333328"),
+    # CCSS, facturación desde enero 2026: BMC del SEM ₡346 789 y del IVM ₡324 590 (Odoo usaba
+    # ₡333 328 para todo). Tasas por régimen: SEM 5,50 / 9,25 %; IVM 4,33 / 5,58 % (Transitorio XI
+    # del Reglamento del IVM).
+    bmc_mensual=D("346789"),
+    bmc_ivm_mensual=D("324590"),
+    ccss_sem_obrero=D("0.055"), ccss_ivm_obrero=D("0.0433"),
+    ccss_sem_patronal=D("0.0925"), ccss_ivm_patronal=D("0.0558"),
     ins_tasas={
         "I": D("0.0087"), "II": D("0.0149"), "III": D("0.0247"),
         "IV": D("0.0413"), "V": D("0.0688"),
@@ -95,7 +107,8 @@ def desde_json(vigente_desde: date, datos: dict) -> ParametrosLegales:
     dec = {"ccss_obrero", "ccss_obrero_pensionado_estado", "ccss_patronal", "bmc_mensual",
            "rop_obrero", "rop_patronal", "prov_aguinaldo", "prov_vacaciones",
            "prov_cesantia_defecto", "credito_hijo", "credito_conyuge", "max_pct_embargo",
-           "salario_minimo_inembargable"}
+           "salario_minimo_inembargable", "bmc_ivm_mensual", "ccss_sem_obrero", "ccss_ivm_obrero",
+           "ccss_sem_patronal", "ccss_ivm_patronal"}
     enteros = {"dias_mes", "dias_incapacidad_patrono", "cesantia_max_anios", "edad_limite_bmc_reducida"}
     kw: dict = {}
     for k, v in datos.items():
@@ -133,6 +146,8 @@ def a_json(p: ParametrosLegales) -> dict:
         "dias_mes": p.dias_mes, "dias_incapacidad_patrono": p.dias_incapacidad_patrono,
         "max_pct_embargo": str(p.max_pct_embargo), "edad_limite_bmc_reducida": p.edad_limite_bmc_reducida,
         "salario_minimo_inembargable": str(p.salario_minimo_inembargable),
+        **{k: str(getattr(p, k)) for k in ("bmc_ivm_mensual", "ccss_sem_obrero", "ccss_ivm_obrero", "ccss_sem_patronal",
+                                           "ccss_ivm_patronal") if getattr(p, k) is not None},
     }
 
 

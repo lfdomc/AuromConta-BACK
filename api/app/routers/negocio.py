@@ -38,7 +38,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from .. import config, crud, db
 from ..auth import Contexto, admin_empresa, admin_plataforma
 from ..fechas import hoy_cr
-from ..servicios import alertas, cifrado, comisiones, facturacion, tilopay
+from ..servicios import alertas, cifrado, comisiones, facturacion, tareas, tilopay
 from ..servicios.facturacion import _q
 
 log = logging.getLogger("aurom.negocio")
@@ -302,6 +302,9 @@ def procesar_cobros(conn, hoy: date) -> dict:
         except Exception as exc:  # noqa: BLE001 - un cliente con error no detiene a los demás
             log.exception("Cobro de %s falló", c["razon_social"])
             res["errores"].append(f"{c['razon_social']}: {getattr(exc, 'detail', exc)}")
+        # Se guarda cliente por cliente: si el servidor se cae a la mitad, los cobros ya hechos en
+        # Tilopay quedan registrados y no se vuelven a cobrar en la siguiente corrida.
+        conn.commit()
     res["resumen"] = {e: sum(1 for x in res["clientes"] if x["estado"] == e) for e in ESTADOS_COBRABLES}
     res["aprobados"] = sum(1 for x in res["clientes"] for i in x["intentos"] if i["resultado"] == "aprobado")
     res["rechazados"] = sum(1 for x in res["clientes"] for i in x["intentos"] if i["resultado"] != "aprobado")
@@ -321,6 +324,8 @@ def procesar_facturas(conn, hoy: date) -> dict:
         except Exception as exc:  # noqa: BLE001
             res["errores"].append(f"{nombre}: {getattr(exc, 'detail', exc)}")
             return None
+        finally:
+            conn.commit()      # cada comprobante enviado a Hacienda queda guardado de una vez
 
     for c in conn.execute("""select c.* from negocio.clientes c where c.estado in ('activo','gracia','solo_lectura')
                                and not exists (select 1 from negocio.metodos_pago m where m.cliente_id = c.id and m.estado = 'activo')""",
@@ -360,15 +365,19 @@ def cron_autorizado(x_cron_secret: str = Header(default="")) -> None:
 
 @cron.post("/cobros", dependencies=[Depends(cron_autorizado)], summary="Cobros con tarjeta y estados de servicio (diario)")
 def cron_cobros(fecha: date | None = Query(None, description="Solo para pruebas o reprocesos")) -> dict:
-    with db.sistema() as conn:
-        return procesar_cobros(conn, fecha or hoy_cr())
+    def correr() -> dict:
+        with db.sistema() as conn:
+            return procesar_cobros(conn, fecha or hoy_cr())
+    return tareas.ejecutar("cobros", correr, reproceso=fecha is not None)
 
 
 @cron.post("/facturas", dependencies=[Depends(cron_autorizado)],
            summary="Genera, emite y consulta comprobantes en Hacienda (diario o cada hora)")
 def cron_facturas(fecha: date | None = Query(None)) -> dict:
-    with db.sistema() as conn:
-        return procesar_facturas(conn, fecha or hoy_cr())
+    def correr() -> dict:
+        with db.sistema() as conn:
+            return procesar_facturas(conn, fecha or hoy_cr())
+    return tareas.ejecutar("facturas", correr, reproceso=fecha is not None)
 
 
 # =============================================================================

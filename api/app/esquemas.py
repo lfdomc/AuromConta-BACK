@@ -178,6 +178,24 @@ class SalarioMinimoIn(Base):
     decreto: str | None = Field(None, max_length=200)
 
 
+class BaseLegalIn(Base):
+    """Una regla del sistema con la norma que la respalda (catálogo global de la plataforma)."""
+    clave: str = Field(min_length=2, max_length=60, pattern=r"^[a-z0-9_]+$")
+    tema: str = Field(min_length=1, max_length=80)
+    titulo: str = Field(min_length=1, max_length=160)
+    regla: str = Field(min_length=1, max_length=2000)
+    norma: str = Field(min_length=1, max_length=1000)
+    publicacion: str | None = Field(None, max_length=300)
+    vigente_desde: date | None = None
+    fuente: str | None = Field(None, max_length=120)
+    enlace: str | None = Field(None, max_length=300, pattern=r"^https://")
+    como_buscar: str | None = Field(None, max_length=300)
+    donde: list[str] = Field(default_factory=list, max_length=20)
+    nota: str | None = Field(None, max_length=1000)
+    verificado_en: date | None = None
+    orden: int = 0
+
+
 class HorarioIn(Base):
     nombre: str
     horas_diarias: Decimal = Decimal("8")
@@ -355,12 +373,17 @@ def _reglas_licencia(m):
     if t.unidad == "horas":
         m.unidad = "horas"
         if "tipo" in m.model_fields_set and not getattr(m, "horas", None):
-            raise ValueError("Indique las horas de la licencia (por ejemplo 1 por día de lactancia)")
+            raise ValueError("Indique las horas diarias de lactancia: 1 por cada bebé lactante (Ley 10895)")
     if t.evento and "tipo" in m.model_fields_set and not getattr(m, "fecha_evento", None):
         raise ValueError(f"Indique la {t.evento.lower()}")
     if t.parentesco and "tipo" in m.model_fields_set and not getattr(m, "parentesco", None):
         raise ValueError("Indique el parentesco con la persona fallecida")
     ev, desde = getattr(m, "fecha_evento", None), getattr(m, "desde", None)
+    hasta = getattr(m, "hasta", None)
+    if t.codigo == "lactancia" and ev and desde and hasta:
+        problema = licencias.periodo_lactancia(ev, desde, hasta, getattr(m, "numero_documento", None))
+        if problema:
+            raise ValueError(problema)
     if ev and desde and desde < ev and t.codigo != "lactancia":
         raise ValueError(f"La licencia no puede empezar antes de la {t.evento.lower()}")
     return m

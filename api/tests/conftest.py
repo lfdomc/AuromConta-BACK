@@ -9,6 +9,7 @@ os.environ.setdefault("ENTORNO", "pruebas")
 os.environ.setdefault("CLAVE_CIFRADO", "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=")
 os.environ.setdefault("LIMITE_POR_MINUTO", "100000")
 os.environ.setdefault("LIMITE_SENSIBLE_POR_MINUTO", "100000")
+os.environ.setdefault("CRON_LIMITES", "no")      # las pruebas llaman las tareas muchas veces seguidas
 
 import jwt
 import psycopg

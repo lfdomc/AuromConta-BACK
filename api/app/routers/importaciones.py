@@ -1795,6 +1795,7 @@ def diagnostico(ctx: Contexto = Depends(contexto_empresa)) -> list[dict]:
     minimos = ctx.conn.execute("""select categoria, monto from salarios_minimos
                                    where vigente_desde = (select max(vigente_desde) from salarios_minimos
                                                            where vigente_desde <= %s)
+                                     and categoria not ilike '%%dom_stic%%'   -- el doméstico tiene su propio mínimo
                                    order by monto limit 1""", (hoy,)).fetchall()
     for x in emps:
         n = f"{x['nombre']} {x['apellidos']}".strip()
@@ -1818,9 +1819,9 @@ def diagnostico(ctx: Contexto = Depends(contexto_empresa)) -> list[dict]:
         if (minimo and not x["por_asistencia"] and not x["medio_tiempo"] and x["asegurado_ccss"]
                 and Decimal(x["salario_mensual"]) and Decimal(x["salario_mensual"]) < minimo["monto"]):
             add("aviso", "salario", f"{n}: el salario ({x['salario_mensual']}) es menor que el mínimo más bajo del MTSS "
-                                    f"({minimo['categoria']}: {minimo['monto']})", x["id"])
+                                    f"({minimo['categoria']}: {minimo['monto']}, Art. 177 CT y decreto de salarios mínimos)", x["id"])
         if not x["fecha_nacimiento"]:
-            add("info", "datos", f"{n}: sin fecha de nacimiento (se usa para la base mínima reducida)", x["id"])
+            add("info", "datos", f"{n}: sin fecha de nacimiento", x["id"])
         if Decimal(x["saldo_vacaciones"]) < 0:
             add("aviso", "vacaciones", f"{n}: saldo de vacaciones negativo ({x['saldo_vacaciones']} días)", x["id"])
         if x["fecha_salida"] and x["fecha_salida"] < hoy:

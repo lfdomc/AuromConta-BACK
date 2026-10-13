@@ -167,7 +167,16 @@ def boleta_pdf(empresa: dict, planilla: dict, empleado: dict, boleta: dict, line
         el.append(Paragraph(f"Depósito a la cuenta {empleado['iban']}", SUB))
     if nota:
         el += [Spacer(1, 8), Paragraph(nota, NOR)]
-    el += [Spacer(1, 18), Paragraph("Generado con Planilla Costa Rica · auromtec.com", SUB)]
+    from . import citas_legales
+    claves = ["ccss_cuotas", "renta"]
+    if int(boleta.get("dias_incapacidad") or 0):
+        claves.append("incapacidad")
+    if Decimal(boleta.get("horas_extra") or 0):
+        claves.append("horas_extra")
+    if Decimal(boleta.get("embargos") or 0) or Decimal(boleta.get("pensiones") or 0):
+        claves.append("embargos")
+    el += [Spacer(1, 10), Paragraph(citas_legales.texto(claves), SUB),
+           Spacer(1, 8), Paragraph("Generado con Planilla Costa Rica · auromtec.com", SUB)]
     doc.build(el)
     return buf.getvalue()
 

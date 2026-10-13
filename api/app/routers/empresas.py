@@ -33,6 +33,7 @@ from ..esquemas import (
     LogoIn,
     ModuloCodigo,
     NuevaEmpresa,
+    BaseLegalIn,
     SalarioMinimoIn,
     SucursalIn,
     TipoCobroIn,
@@ -41,7 +42,7 @@ from ..esquemas import (
     UsuarioEmpresaIn,
     UsuarioEmpresaUpd,
 )
-from ..servicios import marca, pdf
+from ..servicios import cache, marca, pdf
 
 r = APIRouter(tags=["empresas"])
 
@@ -283,19 +284,56 @@ def restaurar_catalogos(ctx: Contexto = Depends(admin_empresa)) -> dict:
     return {"ok": True}
 
 
+_CAMPOS_BL = ("tema", "titulo", "regla", "norma", "publicacion", "vigente_desde", "fuente", "enlace", "como_buscar",
+              "donde", "nota", "verificado_en", "orden")
+
+
+@r.get("/base-legal", tags=["catalogos"], summary="Base legal de cada regla del sistema (ley, decreto, artículo y fuente)")
+def base_legal(response: Response, conn: Conexion = Depends(conexion)) -> list[dict]:
+    response.headers["Cache-Control"] = "private, max-age=600"
+    return cache.obtener("base_legal", 600, lambda: conn.execute("select * from base_legal order by orden, clave").fetchall())
+
+
+@r.put("/plataforma/base-legal/{clave}", tags=["catalogos"], summary="Crear o corregir una entrada de la base legal")
+def guardar_base_legal(clave: str, datos: BaseLegalIn, conn: Conexion = Depends(admin_plataforma)) -> dict:
+    cache.borrar("base_legal")
+    if datos.clave != clave:
+        raise HTTPException(422, "La clave del cuerpo no coincide con la de la ruta")
+    return conn.execute("""
+        insert into base_legal (clave, tema, titulo, regla, norma, publicacion, vigente_desde, fuente, enlace,
+                                como_buscar, donde, nota, verificado_en, orden)
+        values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        on conflict (clave) do update set
+          tema = excluded.tema, titulo = excluded.titulo, regla = excluded.regla, norma = excluded.norma,
+          publicacion = excluded.publicacion, vigente_desde = excluded.vigente_desde, fuente = excluded.fuente,
+          enlace = excluded.enlace, como_buscar = excluded.como_buscar, donde = excluded.donde, nota = excluded.nota,
+          verificado_en = excluded.verificado_en, orden = excluded.orden, actualizado_en = now()
+        returning *""", (clave, *(getattr(datos, c) for c in _CAMPOS_BL))).fetchone()
+
+
+@r.delete("/plataforma/base-legal/{clave}", status_code=204, tags=["catalogos"])
+def borrar_base_legal(clave: str, conn: Conexion = Depends(admin_plataforma)) -> None:
+    cache.borrar("base_legal")
+    conn.execute("delete from base_legal where clave = %s", (clave,))
+
+
 @r.get("/salarios-minimos", tags=["catalogos"], summary="Salarios mínimos del MTSS (vigentes y anteriores)")
-def salarios_minimos(conn: Conexion = Depends(conexion)) -> list[dict]:
-    return conn.execute("select * from salarios_minimos order by vigente_desde desc, monto").fetchall()
+def salarios_minimos(response: Response, conn: Conexion = Depends(conexion)) -> list[dict]:
+    response.headers["Cache-Control"] = "private, max-age=600"
+    return cache.obtener("salarios_minimos", 600,
+                         lambda: conn.execute("select * from salarios_minimos order by vigente_desde desc, monto").fetchall())
 
 
 @r.post("/plataforma/salarios-minimos", status_code=201, tags=["catalogos"])
 def crear_salario_minimo(datos: SalarioMinimoIn, conn: Conexion = Depends(admin_plataforma)) -> dict:
+    cache.borrar("salarios_minimos")
     return conn.execute("""insert into salarios_minimos (categoria, monto, vigente_desde, decreto) values (%s,%s,%s,%s)
                            returning *""", (datos.categoria, datos.monto, datos.vigente_desde, datos.decreto)).fetchone()
 
 
 @r.patch("/plataforma/salarios-minimos/{id}", tags=["catalogos"])
 def editar_salario_minimo(id: UUID, datos: SalarioMinimoIn, conn: Conexion = Depends(admin_plataforma)) -> dict:
+    cache.borrar("salarios_minimos")
     fila = conn.execute("""update salarios_minimos set categoria = %s, monto = %s, vigente_desde = %s, decreto = %s
                             where id = %s returning *""",
                         (datos.categoria, datos.monto, datos.vigente_desde, datos.decreto, id)).fetchone()
@@ -306,4 +344,5 @@ def editar_salario_minimo(id: UUID, datos: SalarioMinimoIn, conn: Conexion = Dep
 
 @r.delete("/plataforma/salarios-minimos/{id}", status_code=204, tags=["catalogos"])
 def borrar_salario_minimo(id: UUID, conn: Conexion = Depends(admin_plataforma)) -> None:
+    cache.borrar("salarios_minimos")
     conn.execute("delete from salarios_minimos where id = %s", (id,))

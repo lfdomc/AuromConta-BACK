@@ -47,7 +47,8 @@ class _Base(BaseModel):
 # =============================================================== Validación ==
 CLAVES_DECIMAL = {"ccss_obrero", "ccss_obrero_pensionado_estado", "ccss_patronal", "bmc_mensual", "rop_obrero",
                   "rop_patronal", "prov_aguinaldo", "prov_vacaciones", "prov_cesantia_defecto", "credito_hijo",
-                  "credito_conyuge", "max_pct_embargo"}
+                  "credito_conyuge", "max_pct_embargo", "bmc_ivm_mensual", "ccss_sem_obrero", "ccss_ivm_obrero",
+                  "ccss_sem_patronal", "ccss_ivm_patronal", "salario_minimo_inembargable"}
 CLAVES_ENTERAS = {"dias_mes", "dias_incapacidad_patrono", "cesantia_max_anios", "edad_limite_bmc_reducida"}
 CLAVES = CLAVES_DECIMAL | CLAVES_ENTERAS | {"ins_tasas", "ins_clase_defecto", "cesantia_tabla", "tramos_renta"}
 # Rangos razonables: cualquier valor fuera de estos casi seguro es un error de digitación
@@ -60,7 +61,10 @@ RANGOS = {
     "prov_cesantia_defecto": (Decimal("0"), Decimal("0.1")), "credito_hijo": (Decimal("0"), Decimal("100000")),
     "credito_conyuge": (Decimal("0"), Decimal("100000")), "max_pct_embargo": (Decimal("0"), Decimal("100")),
     "dias_mes": (28, 31), "dias_incapacidad_patrono": (0, 30), "cesantia_max_anios": (1, 30),
-    "edad_limite_bmc_reducida": (18, 99),
+    "edad_limite_bmc_reducida": (0, 99),          # 0 = sin límite de edad (CCSS, desde 2025)
+    "bmc_ivm_mensual": (Decimal("1000"), Decimal("5000000")), "salario_minimo_inembargable": (Decimal("1000"), Decimal("5000000")),
+    "ccss_sem_obrero": (Decimal("0"), Decimal("0.15")), "ccss_ivm_obrero": (Decimal("0"), Decimal("0.15")),
+    "ccss_sem_patronal": (Decimal("0"), Decimal("0.2")), "ccss_ivm_patronal": (Decimal("0"), Decimal("0.2")),
 }
 SALARIOS_PRUEBA = ["250000", "700000", "1000000", "1500000", "2500000", "5000000"]
 
@@ -120,6 +124,13 @@ def validar_parametros(vigente_desde: date, datos: dict, base: dict | None = Non
         lo, hi = RANGOS.get(k, (None, None))
         if lo is not None and not (lo <= v <= hi):
             errores.append(f"{k} = {combinados[k]} está fuera del rango esperado [{lo}, {hi}]")
+
+    try:
+        sem_ivm = [_dec(combinados[k]) for k in ("ccss_sem_obrero", "ccss_ivm_obrero", "ccss_obrero")]
+        if sem_ivm[0] + sem_ivm[1] > sem_ivm[2]:
+            errores.append("SEM + IVM obrero no puede ser mayor que la cuota obrera total de la CCSS")
+    except (KeyError, ValueError):
+        pass
 
     ins = combinados.get("ins_tasas")
     if ins is not None:
@@ -211,7 +222,12 @@ def validar_parametros(vigente_desde: date, datos: dict, base: dict | None = Non
                 fallas.append("costo patronal menor que el bruto")
             if not kw.get("exento") and not kw.get("pensionado"):
                 esperado = (res.base_ccss * p.ccss_obrero).quantize(Decimal("0.01"))
-                if abs(res.ccss_obrero - esperado) > Decimal("1"):
+                if res.bmc_aplicada and p.bmc_ivm_mensual is not None:
+                    # La BMC sube solo SEM e IVM: queda entre el salario × tasa y la BMC × tasa.
+                    piso = (res.base_cotizable * p.ccss_obrero).quantize(Decimal("0.01"))
+                    if not (piso - 1 <= res.ccss_obrero <= esperado + 1):
+                        fallas.append(f"CCSS obrero {res.ccss_obrero} fuera de [{piso}, {esperado}]")
+                elif abs(res.ccss_obrero - esperado) > Decimal("1"):
                     fallas.append(f"CCSS obrero {res.ccss_obrero} ≠ base × tasa {esperado}")
             if kw.get("exento") and (res.ccss_obrero or res.renta):
                 fallas.append("un empleado exento no debe pagar CCSS ni renta")
@@ -233,6 +249,8 @@ def validar_parametros(vigente_desde: date, datos: dict, base: dict | None = Non
 def insertar_parametros(conn: Conexion, vigente_desde: date, datos: dict, fuente: str | None,
                         usuario_id) -> dict:
     datos = {k: v for k, v in datos.items() if k != "vigente_desde"}
+    from ..servicios import cache
+    cache.borrar("parametros:")
     try:
         with conn.transaction():
             return conn.execute("""insert into parametros_legales (vigente_desde, datos, fuente, aprobado_por)

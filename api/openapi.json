@@ -1390,6 +1390,164 @@
     }
    }
   },
+  "/base-legal": {
+   "get": {
+    "tags": [
+     "empresas",
+     "catalogos"
+    ],
+    "summary": "Base legal de cada regla del sistema (ley, decreto, artículo y fuente)",
+    "operationId": "base_legal_base_legal_get",
+    "parameters": [
+     {
+      "name": "authorization",
+      "in": "header",
+      "required": false,
+      "schema": {
+       "type": "string",
+       "default": "",
+       "title": "Authorization"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "Successful Response",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "array",
+         "items": {
+          "type": "object",
+          "additionalProperties": true
+         },
+         "title": "Response Base Legal Base Legal Get"
+        }
+       }
+      }
+     },
+     "422": {
+      "description": "Validation Error",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/plataforma/base-legal/{clave}": {
+   "put": {
+    "tags": [
+     "empresas",
+     "catalogos"
+    ],
+    "summary": "Crear o corregir una entrada de la base legal",
+    "operationId": "guardar_base_legal_plataforma_base_legal__clave__put",
+    "parameters": [
+     {
+      "name": "clave",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string",
+       "title": "Clave"
+      }
+     },
+     {
+      "name": "authorization",
+      "in": "header",
+      "required": false,
+      "schema": {
+       "type": "string",
+       "default": "",
+       "title": "Authorization"
+      }
+     }
+    ],
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/BaseLegalIn"
+       }
+      }
+     }
+    },
+    "responses": {
+     "200": {
+      "description": "Successful Response",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "additionalProperties": true,
+         "title": "Response Guardar Base Legal Plataforma Base Legal  Clave  Put"
+        }
+       }
+      }
+     },
+     "422": {
+      "description": "Validation Error",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      }
+     }
+    }
+   },
+   "delete": {
+    "tags": [
+     "empresas",
+     "catalogos"
+    ],
+    "summary": "Borrar Base Legal",
+    "operationId": "borrar_base_legal_plataforma_base_legal__clave__delete",
+    "parameters": [
+     {
+      "name": "clave",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string",
+       "title": "Clave"
+      }
+     },
+     {
+      "name": "authorization",
+      "in": "header",
+      "required": false,
+      "schema": {
+       "type": "string",
+       "default": "",
+       "title": "Authorization"
+      }
+     }
+    ],
+    "responses": {
+     "204": {
+      "description": "Successful Response"
+     },
+     "422": {
+      "description": "Validation Error",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
   "/salarios-minimos": {
    "get": {
     "tags": [
@@ -18832,6 +18990,18 @@
       }
      },
      {
+      "name": "con_historial",
+      "in": "query",
+      "required": false,
+      "schema": {
+       "type": "boolean",
+       "description": "Incluir cada chequeo (hasta 2 000 filas)",
+       "default": false,
+       "title": "Con Historial"
+      },
+      "description": "Incluir cada chequeo (hasta 2 000 filas)"
+     },
+     {
       "name": "authorization",
       "in": "header",
       "required": false,
@@ -18873,7 +19043,7 @@
     "tags": [
      "cron"
     ],
-    "summary": "Chequeo de servicios (cada 5-15 min)",
+    "summary": "Chequeo de servicios (cada 15 min)",
     "operationId": "cron_salud_cron_salud_post",
     "parameters": [
      {
@@ -18993,7 +19163,6 @@
      "cron"
     ],
     "summary": "Verifica la bitácora encadenada y envía su huella fuera de la base (diario)",
-    "description": "La huella final de la cadena se manda por Telegram a la dueña: si alguien con acceso\ntotal a la base reescribiera la bitácora, la huella dejaría de coincidir con las enviadas.",
     "operationId": "ancla_auditoria_cron_ancla_auditoria_post",
     "parameters": [
      {
@@ -21892,6 +22061,150 @@
      "fecha_efectiva"
     ],
     "title": "AumentoMasivoIn"
+   },
+   "BaseLegalIn": {
+    "properties": {
+     "clave": {
+      "type": "string",
+      "maxLength": 60,
+      "minLength": 2,
+      "pattern": "^[a-z0-9_]+$",
+      "title": "Clave"
+     },
+     "tema": {
+      "type": "string",
+      "maxLength": 80,
+      "minLength": 1,
+      "title": "Tema"
+     },
+     "titulo": {
+      "type": "string",
+      "maxLength": 160,
+      "minLength": 1,
+      "title": "Titulo"
+     },
+     "regla": {
+      "type": "string",
+      "maxLength": 2000,
+      "minLength": 1,
+      "title": "Regla"
+     },
+     "norma": {
+      "type": "string",
+      "maxLength": 1000,
+      "minLength": 1,
+      "title": "Norma"
+     },
+     "publicacion": {
+      "anyOf": [
+       {
+        "type": "string",
+        "maxLength": 300
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Publicacion"
+     },
+     "vigente_desde": {
+      "anyOf": [
+       {
+        "type": "string",
+        "format": "date"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Vigente Desde"
+     },
+     "fuente": {
+      "anyOf": [
+       {
+        "type": "string",
+        "maxLength": 120
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Fuente"
+     },
+     "enlace": {
+      "anyOf": [
+       {
+        "type": "string",
+        "maxLength": 300,
+        "pattern": "^https://"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Enlace"
+     },
+     "como_buscar": {
+      "anyOf": [
+       {
+        "type": "string",
+        "maxLength": 300
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Como Buscar"
+     },
+     "donde": {
+      "items": {
+       "type": "string"
+      },
+      "type": "array",
+      "maxItems": 20,
+      "title": "Donde"
+     },
+     "nota": {
+      "anyOf": [
+       {
+        "type": "string",
+        "maxLength": 1000
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Nota"
+     },
+     "verificado_en": {
+      "anyOf": [
+       {
+        "type": "string",
+        "format": "date"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Verificado En"
+     },
+     "orden": {
+      "type": "integer",
+      "title": "Orden",
+      "default": 0
+     }
+    },
+    "additionalProperties": false,
+    "type": "object",
+    "required": [
+     "clave",
+     "tema",
+     "titulo",
+     "regla",
+     "norma"
+    ],
+    "title": "BaseLegalIn",
+    "description": "Una regla del sistema con la norma que la respalda (catálogo global de la plataforma)."
    },
    "Body_importar_empresas__empresa_id__importaciones__tipo__post": {
     "properties": {

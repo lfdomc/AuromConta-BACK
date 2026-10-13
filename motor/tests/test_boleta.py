@@ -124,15 +124,23 @@ def test_reconciliacion_mensual_consolidada():
 def test_bmc_piso():
     r = calcular_boleta(mensual(200_000, fecha_nacimiento=date(1980, 1, 1)))
     assert r.bmc_aplicada
-    assert r.base_ccss == D("333328")
-    assert r.ccss_obrero == D("36099.42")
-    assert r.ccss_patronal == D("89431.90")
+    # BMC 2026 por régimen: SEM ₡346 789 e IVM ₡324 590; el resto de la cuota va sobre el salario real.
+    assert r.base_ccss == D("346789")
+    # 200 000 × 10,83 % + 146 789 × 5,50 % (SEM) + 124 590 × 4,33 % (IVM)
+    assert r.ccss_obrero == D("35128.14")
+    # 200 000 × 26,83 % + 146 789 × 9,25 % + 124 590 × 5,58 %
+    assert r.ccss_patronal == D("74190.10")
 
 
-def test_bmc_reducida_medio_tiempo_menor_35():
-    r = calcular_boleta(mensual(200_000, medio_tiempo=True, fecha_nacimiento=date(2000, 1, 1)))
+def test_bmc_reducida_medio_tiempo_cualquier_edad():
+    # CCSS sesión 9275: desde 2025 la BMC reducida de jornada parcial aplica a todas las edades.
+    r = calcular_boleta(mensual(200_000, medio_tiempo=True, fecha_nacimiento=date(1970, 1, 1)))
     assert not r.bmc_aplicada and r.bmc_reducida
-    assert r.ccss_obrero == D("21660.00")
+    assert r.ccss_obrero == D("21660.00")       # 200 000 supera la BMC reducida (₡173 394,50)
+    r = calcular_boleta(mensual(70_000, medio_tiempo=True))
+    assert r.bmc_aplicada and r.base_ccss == D("173394.50")
+    # 70 000 × 10,83 % + (173 394,50 − 70 000) × 5,50 % SEM + (81 147,50 − 70 000) × 4,33 % IVM (cuota 0,50)
+    assert r.ccss_obrero == D("13750.38")
 
 
 def test_bmc_se_puede_apagar():
@@ -414,3 +422,19 @@ def test_costo_patronal_incluye_ingreso_no_salarial():
     r = calcular_boleta(e)
     cargas = r.ccss_patronal + r.ins_patronal + r.prov_aguinaldo + r.prov_cesantia + r.prov_vacaciones
     assert r.costo_total_patrono == D("300000") + D("30000") + cargas
+
+
+def test_incapacidad_dentro_de_30_dias_sin_dias_patrono():
+    # Reglamento del Seguro de Salud art. 35: una nueva incapacidad dentro de los 30 días
+    # posteriores a la anterior se subsidia desde el primer día (el patrono no paga días 1-3).
+    from planilla_motor.incapacidades import calcular_incapacidades
+    from planilla_motor.modelos import Frecuencia, Incapacidad, TipoIncapacidad
+    from planilla_motor.parametros import PARAMETROS_2026
+    a = Incapacidad(TipoIncapacidad.ENFERMEDAD, date(2026, 3, 2), date(2026, 3, 4), D("20000"))
+    b = Incapacidad(TipoIncapacidad.ENFERMEDAD, date(2026, 3, 20), date(2026, 3, 22), D("20000"))
+    sola = calcular_incapacidades([b], date(2026, 3, 16), date(2026, 3, 31), D("600000"), Frecuencia.QUINCENAL, D(1),
+                                  PARAMETROS_2026)
+    con_previa = calcular_incapacidades([a, b], date(2026, 3, 16), date(2026, 3, 31), D("600000"), Frecuencia.QUINCENAL,
+                                        D(1), PARAMETROS_2026)
+    assert sola.costo_patrono == D("30000.00") and sola.subsidio_ccss == 0
+    assert con_previa.costo_patrono == 0 and con_previa.subsidio_ccss == D("36000.00")

@@ -13,8 +13,14 @@ Lo que dice la ley (revisado en octubre de 2026; confirmar cambios con el contad
   (padres, hijos, cónyuge o conviviente, suegros, yernos y nueras) y un día hábil por segundo
   y tercer grado (abuelos, nietos, hermanos, cuñados, tíos, sobrinos, bisabuelos, bisnietos).
   La paga el patrono (es salario).
-* Lactancia — Arts. 95 y 97 CT: una hora diaria remunerada dentro de la jornada, como mínimo
-  durante el primer año del menor (la reforma del expediente 24.481 de 2026 amplía modalidades).
+* Lactancia — Arts. 95, 97 y 97 bis CT, reformados por la Ley 10895 «Ley para proteger, promover y
+  apoyar la lactancia materna» (Alcance 41 a La Gaceta 74, 23/4/2026, rige desde su publicación):
+  el primer año de vida es período de lactancia sin certificado; después se prorroga cada tres
+  meses con certificado médico (público o privado) mientras el bebé tome leche materna. Una hora
+  remunerada por cada bebé lactante en la jornada ordinaria (15 min cada 2 h, dos medias horas, o
+  entrar/salir una hora antes); 15 min más cada 3 h de jornada extraordinaria; y, aparte, 25 min
+  cada 3 h para extracción de leche, pagados como tiempo trabajado y no acumulables. También aplica
+  a la madre adoptante. Nada de esto se rebaja del salario.
 * Matrimonio — el Código de Trabajo NO obliga al sector privado: depende del reglamento interno
   o la convención colectiva (Odoo la ponía como obligatoria con «Art. 37», lo cual no es correcto).
 
@@ -52,7 +58,7 @@ TIPOS: dict[str, TipoLicencia] = {t.codigo: t for t in [
                  "Art. 69 inc. l) CT · Ley 10589", "patrono", 3, evento="Fecha del fallecimiento", parentesco=True),
     TipoLicencia("duelo_segundo_tercer", "Duelo — segundo y tercer grado (abuelos, nietos, hermanos, cuñados, tíos, sobrinos)",
                  "Art. 69 inc. l) CT · Ley 10589", "patrono", 1, evento="Fecha del fallecimiento", parentesco=True),
-    TipoLicencia("lactancia", "Lactancia — hora diaria", "Arts. 95 y 97 CT", "patrono", 0, unidad="horas",
+    TipoLicencia("lactancia", "Lactancia — hora diaria", "Arts. 95, 97 y 97 bis CT · Ley 10895", "patrono", 0, unidad="horas",
                  evento="Fecha de nacimiento"),
     TipoLicencia("matrimonio", "Matrimonio (según política de la empresa)", "No obligatoria por ley en el sector privado",
                  "empresa"),
@@ -91,6 +97,24 @@ def avisos(codigo: str, dias, desde, hasta, fecha_evento) -> list[str]:
     if t.ventana_dias and fecha_evento and hasta and (hasta - fecha_evento).days >= t.ventana_dias:
         out.append(f"La ley la ubica en las primeras {t.ventana_dias // 7} semanas desde el nacimiento.")
     return out
+
+
+def periodo_lactancia(fecha_nacimiento, desde, hasta, certificado: str | None) -> str | None:
+    """Ley 10895: el primer año no pide certificado; después, prórrogas de tres meses con certificado médico."""
+    from datetime import timedelta
+    try:
+        un_anio = fecha_nacimiento.replace(year=fecha_nacimiento.year + 1)
+    except ValueError:                                   # 29 de febrero
+        un_anio = fecha_nacimiento.replace(year=fecha_nacimiento.year + 1, day=28)
+    if hasta <= un_anio:
+        return None
+    if not certificado:
+        return (f"El primer año de lactancia termina el {un_anio:%d/%m/%Y}. Para seguir después se necesita "
+                "un certificado médico de prórroga (Ley 10895): anote su número.")
+    inicio_prorroga = max(desde, un_anio + timedelta(days=1))
+    if (hasta - inicio_prorroga).days > 92:
+        return "Cada certificado de prórroga cubre tres meses: registre una licencia por cada certificado."
+    return None
 
 
 def catalogo() -> list[dict]:
