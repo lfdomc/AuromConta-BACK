@@ -101,7 +101,12 @@ def ver(id: UUID, ctx: Contexto = Depends(contexto_empresa)) -> dict:
 @r.patch("/{id}")
 def editar(id: UUID, datos: EmpleadoUpd, ctx: Contexto = Depends(operador)) -> dict:
     cambios = datos.model_dump(exclude_unset=True)
-    _validar_tipo(ctx, cambios.get("tipo_empleado"))
+    if cambios.get("tipo_empleado"):
+        # Solo se valida si cambia: un tipo que se borró del catálogo no impide guardar el resto de la ficha.
+        actual_tipo = ctx.conn.execute("select tipo_empleado from empleados where id = %s and empresa_id = %s",
+                                       (id, ctx.empresa_id)).fetchone()
+        if not actual_tipo or actual_tipo["tipo_empleado"] != cambios["tipo_empleado"]:
+            _validar_tipo(ctx, cambios["tipo_empleado"])
     if "calendario_id" in cambios or "frecuencia" in cambios:
         actual = crud.obtener(ctx.conn, "empleados", id, ctx.empresa_id)
         _validar_calendario(ctx, cambios.get("calendario_id", actual["calendario_id"]),

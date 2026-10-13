@@ -803,7 +803,14 @@ def aplicar_incapacidades(est: Estado, filas: list[dict]) -> tuple[int, int]:
 # ------------------------------------------------------------------ permisos --
 COLS_PERMISOS = [
     ID,
-    Col("tipo", "Tipo de permiso", alias=("tipo",), ayuda="personal, paternidad, duelo, matrimonio...", ejemplo="personal"),
+    Col("tipo", "Tipo de permiso", alias=("tipo", "tipo de licencia"),
+        ayuda="paternidad, adopcion, duelo_primer_grado, duelo_segundo_tercer, lactancia, matrimonio, con_goce o sin_goce",
+        ejemplo="con_goce"),
+    Col("fecha_evento", "Fecha del evento", "fecha", alias=("fecha de nacimiento", "fecha del fallecimiento"),
+        ayuda="Nacimiento (paternidad, lactancia), entrega (adopción) o fallecimiento (duelo)"),
+    Col("parentesco", "Parentesco", ayuda="Para duelo: Madre, Hermano(a)..."),
+    Col("horas", "Horas", "numero", ayuda="Para lactancia u otros permisos por horas"),
+    Col("numero_documento", "Número de documento", alias=("certificado", "numero certificado")),
     Col("desde", "Desde", "fecha", True, ejemplo="02/03/2026"),
     Col("hasta", "Hasta", "fecha", True, ejemplo="02/03/2026"),
     Col("dias", "Días", "numero", ayuda="Vacío = días calendario entre las fechas"),
@@ -822,7 +829,19 @@ def validar_permiso(est: Estado, d: dict) -> list[tuple[str, str]]:
     if d["hasta"] < d["desde"]:
         return [("hasta", "La fecha final es anterior a la inicial")]
     err = []
-    d["tipo"] = (d.get("tipo") or "personal").lower()
+    from ..servicios import licencias
+    d["tipo"] = (d.get("tipo") or "con_goce").strip().lower().replace(" ", "_")
+    lic = licencias.tipo(d["tipo"])
+    if lic:
+        d["con_goce"] = licencias.con_goce(lic.codigo, d.get("con_goce"))
+        if lic.unidad == "horas":
+            d["unidad"] = "horas"
+            if not d.get("horas"):
+                err.append(("horas", "Indique las horas de la licencia"))
+        if lic.evento and not d.get("fecha_evento"):
+            err.append(("fecha_evento", f"Falta la {lic.evento.lower()}"))
+        if lic.parentesco and not d.get("parentesco"):
+            err.append(("parentesco", "Falta el parentesco"))
     d["dias"] = d.get("dias") if d.get("dias") is not None else Decimal((d["hasta"] - d["desde"]).days + 1)
     if d["dias"] <= 0:
         err.append(("dias", "Los días deben ser mayores que cero"))
@@ -842,7 +861,8 @@ def aplicar_permisos(est: Estado, filas: list[dict]) -> tuple[int, int]:
     for d in filas:
         emp = d["_emp"] or est.empleados[norm_id(d["identificacion"])]
         datos = {k: d[k] for k in ("tipo", "desde", "hasta", "dias", "con_goce", "monto", "ausencia", "fundamento",
-                                   "estado") if d.get(k) is not None}
+                                   "estado", "unidad", "horas", "fecha_evento", "parentesco", "numero_documento")
+                 if d.get(k) is not None}
         crud.insertar(est.conn, "permisos", {**datos, "empresa_id": est.ctx.empresa_id, "empleado_id": emp["id"]})
     return len(filas), 0
 

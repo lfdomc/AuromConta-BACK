@@ -20,7 +20,7 @@ def enviar(para: str | list[str], asunto: str, html: str, adjuntos: list[tuple[s
     cuerpo = {
         "from": remitente or settings.correo_remitente,
         "to": [para] if isinstance(para, str) else para,
-        "subject": asunto,
+        "subject": una_linea(asunto),
         "html": html,
     }
     if responder_a:
@@ -39,15 +39,25 @@ CUERPO_BOLETA = ("Estimado/a {colaborador}:\n\nAdjunto encontrará su boleta de 
                  "Si tiene alguna consulta, no dude en contactar al departamento de Recursos Humanos.\n\nAtentamente,\n{empresa}")
 
 
+# Variables del módulo Odoo ({period}, {company}, {employee}) para quien copie su plantilla de allá.
+ALIAS_VARIABLES = {"period": "periodo", "company": "empresa", "employee": "colaborador", "nombre": "colaborador"}
+
+
 def plantilla(texto: str | None, defecto: str, **datos: str) -> str:
-    """Rellena {periodo}, {empresa} y {colaborador}. Una llave desconocida se deja tal cual (no falla)."""
-    class _Seguro(dict):
-        def __missing__(self, k):
-            return "{" + k + "}"
-    try:
-        return (texto or defecto).format_map(_Seguro(datos))
-    except (ValueError, IndexError):        # llaves sueltas en el texto: se envía tal cual
-        return texto or defecto
+    """Rellena {periodo}, {empresa} y {colaborador} (y sus equivalentes de Odoo). Solo reemplaza nombres
+    simples: una llave desconocida o cualquier otra cosa entre llaves se deja tal cual (nunca falla)."""
+    import re
+
+    def poner(m: re.Match[str]) -> str:
+        k = m.group(1)
+        k = ALIAS_VARIABLES.get(k, k)
+        return str(datos[k]) if k in datos else m.group(0)
+    return re.sub(r"\{(\w+)\}", poner, texto or defecto)
+
+
+def una_linea(texto: str) -> str:
+    """Asunto de correo: sin saltos de línea (evita cabeceras inyectadas) y de largo razonable."""
+    return " ".join((texto or "").split())[:200]
 
 
 def a_html(texto: str) -> str:

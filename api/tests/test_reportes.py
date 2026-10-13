@@ -8,7 +8,7 @@ import pytest
 from openpyxl import load_workbook
 
 IBAN_OK = "CR05015202001026284066"
-TIPOS = ["resumen-planilla", "ccss", "ins", "renta", "costo-patronal", "costo-sucursal", "detalle-empleado",
+TIPOS = ["resumen-planilla", "ccss", "ins", "renta", "retenciones-208", "costo-patronal", "costo-sucursal", "detalle-empleado",
          "horas-extra", "vacaciones", "prestamos", "embargos-pensiones", "historial-salarial", "incapacidades",
          "resumen-ejecutivo"]
 

@@ -8,6 +8,7 @@ Diferencias intencionales del motor y puntos a confirmar con el contador.
 | H2 | Costo patronal con incapacidad CCSS | Suma el bruto y además el neto del empleado → cuenta el salario dos veces | Bruto + cargas + provisiones + días 1-3 al 50 % | Revisar el reporte de costo patronal en Odoo |
 | H3 | Base de aguinaldo con incapacidad | Resta el subsidio CCSS a una base que ya excluye los días incapacitados (doble resta) | Base = salario cotizable | Confirmar con contador |
 | H4 | Paternidad en quincenal | Diario = monto de la quincena / 30 → la mitad | Diario = salario mensual / 30 | Confirmar con contador |
+| H12 | Paternidad y adopción (Ley 10.211, Art. 95 CT) | Suma el pago de paternidad al 100 % encima del salario normal (se pagaban dos veces esos días) | Los días de ley salen del salario y de la base CCSS; el patrono paga el 50 % del salario promedio de 3 meses (no salarial) y la CCSS el otro 50 % directo al colaborador. Se calcula en la API (servicios/licencias.py); el campo dias_paternidad del motor ya no se usa | Confirmar con el contador |
 | H5 | Base Mínima Contributiva | Un monto único ₡333,328 | Mismo valor por defecto, configurable | La CCSS publicó para 2026 SEM ₡346,789 e IVM ₡324,590; confirmar cuál aplicar |
 | H6 | Cesantía por antigüedad | Primer año usa 19.5 días aunque tenga menos de 1 año | Igual que Odoo | Art. 29 CT: 3-6 meses 7 días, 6-12 meses 14 días; decidir si la provisión lo refleja |
 | H7 | Redondeo | `round()` de Python sobre float | Decimal, mitad hacia arriba | Diferencias de ±₡0.01 posibles en la migración paralela |

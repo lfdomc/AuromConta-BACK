@@ -344,17 +344,74 @@ class IncapacidadIn(Base):
     estado: Literal["borrador", "confirmada", "anulada"] = "confirmada"
 
 
+def _reglas_licencia(m):
+    """Licencias de ley (servicios/licencias.py): quién paga lo dice la ley; se piden los datos que la ley exige."""
+    from .servicios import licencias
+    t = licencias.tipo(getattr(m, "tipo", None))
+    if t is None:
+        return m
+    if getattr(m, "con_goce", None) is not None or "tipo" in m.model_fields_set:
+        m.con_goce = licencias.con_goce(t.codigo, getattr(m, "con_goce", None))
+    if t.unidad == "horas":
+        m.unidad = "horas"
+        if "tipo" in m.model_fields_set and not getattr(m, "horas", None):
+            raise ValueError("Indique las horas de la licencia (por ejemplo 1 por día de lactancia)")
+    if t.evento and "tipo" in m.model_fields_set and not getattr(m, "fecha_evento", None):
+        raise ValueError(f"Indique la {t.evento.lower()}")
+    if t.parentesco and "tipo" in m.model_fields_set and not getattr(m, "parentesco", None):
+        raise ValueError("Indique el parentesco con la persona fallecida")
+    ev, desde = getattr(m, "fecha_evento", None), getattr(m, "desde", None)
+    if ev and desde and desde < ev and t.codigo != "lactancia":
+        raise ValueError(f"La licencia no puede empezar antes de la {t.evento.lower()}")
+    return m
+
+
 class PermisoIn(Base):
+    """Permisos y licencias especiales de ley (paternidad, adopción, duelo, lactancia...)."""
     empleado_id: UUID
-    tipo: str = "personal"
+    tipo: str = Field("con_goce", max_length=40)
     desde: date
     hasta: date
-    dias: Decimal
+    dias: Decimal = Field(gt=0, le=366)
     con_goce: bool = False
     monto: Dinero | None = None
     ausencia: bool = False
     fundamento: str | None = None
     estado: Literal["pendiente", "aprobado", "rechazado"] = "aprobado"
+    unidad: Literal["dias", "horas"] = "dias"
+    horas: Decimal | None = Field(None, gt=0, le=2000)
+    fecha_evento: date | None = None
+    parentesco: str | None = Field(None, max_length=40)
+    pariente: str | None = Field(None, max_length=120)
+    numero_documento: str | None = Field(None, max_length=60)
+
+    @model_validator(mode="after")
+    def _ley(self):
+        if self.hasta < self.desde:
+            raise ValueError("La fecha final es anterior a la inicial")
+        return _reglas_licencia(self)
+
+
+class PermisoUpd(Base):
+    tipo: str | None = Field(None, max_length=40)
+    desde: date | None = None
+    hasta: date | None = None
+    dias: Decimal | None = Field(None, gt=0, le=366)
+    con_goce: bool | None = None
+    monto: Dinero | None = None
+    ausencia: bool | None = None
+    fundamento: str | None = None
+    estado: Literal["pendiente", "aprobado", "rechazado"] | None = None
+    unidad: Literal["dias", "horas"] | None = None
+    horas: Decimal | None = Field(None, gt=0, le=2000)
+    fecha_evento: date | None = None
+    parentesco: str | None = Field(None, max_length=40)
+    pariente: str | None = Field(None, max_length=120)
+    numero_documento: str | None = Field(None, max_length=60)
+
+    @model_validator(mode="after")
+    def _ley(self):
+        return _reglas_licencia(self)
 
 
 class VacacionIn(Base):

@@ -579,7 +579,8 @@ HOJAS: list[Hoja] = [
              CED,
              M("Nombre Empleado (ref)", None, False, 24, "Juan Pérez Rodríguez", "Empleado Prueba"),
              M("Fecha de Corte", "corte", True, 14, "31/12/2025", "31/12/2025",
-               ayuda="Día al que corresponden los montos"),
+               ayuda="Último día de la última planilla pagada fuera del sistema (fin de quincena o de mes). "
+                     "Desde el día siguiente el sistema suma solo"),
              M("Aguinaldo Acumulado (CRC)", "aguinaldo", False, 16, 125000, 40000,
                ayuda="Lo ganado desde el 1 de diciembre hasta la fecha de corte"),
              M("Cesantía Acumulada (CRC) (ref)", None, False, 16),
@@ -909,7 +910,7 @@ def _es_instruccion(fila: list[Any]) -> bool:
         if c is not None and str(c).strip():
             t = str(c).strip()
             tl = t.lower()
-            return (tl.startswith(("warn", "nota:", "instruccion", "instrucción")) or len(t) > 100
+            return (tl.startswith(("warn ", "warn:", "⚠", "nota:", "instruccion", "instrucción")) or len(t) > 100
                     or bool(re.match(r"^\d+\.\s+\D", t)))
     return False
 
@@ -929,10 +930,9 @@ def filas_de_hoja(espec: Espec, filas: list[list[Any]], incluir_prueba: bool) ->
     for n, fila in enumerate(filas[i_enc + 1:], start=i_enc + 2):
         if _es_instruccion(fila):
             break
-        celdas = {norm_id(x) for x in fila if x is not None}
-        if ej in celdas:
-            continue
         d = {clave: (fila[j] if j < len(fila) else None) for j, clave in mapa.items()}
+        if norm_id(d.get("identificacion")) == ej:          # fila verde de ejemplo
+            continue
         if all(v is None or (isinstance(v, str) and not v.strip()) for v in d.values()):
             continue
         if norm_id(d.get("identificacion")) == pr and not incluir_prueba:

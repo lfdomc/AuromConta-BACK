@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from planilla_motor.dinero import r2
 
 from .. import crud
-from ..auth import Contexto, aprobador, operador, requiere_modulo
+from ..auth import Contexto, aprobador, contexto_empresa, operador, requiere_modulo
 from ..esquemas import (
     BonoIn,
     EmbargoIn,
@@ -16,6 +16,7 @@ from ..esquemas import (
     OtraDeduccionIn,
     PensionIn,
     PermisoIn,
+    PermisoUpd,
     PrestamoIn,
     RebajoRentaIn,
     VacacionIn,
@@ -83,6 +84,12 @@ def pagos_prestamo(id: UUID, ctx: Contexto = Depends(operador)) -> list[dict]:
                             (id, ctx.empresa_id)).fetchall()
 
 
+@r.get("/tipos-licencia", tags=["novedades"], summary="Licencias especiales de ley: base legal, días y quién paga")
+def tipos_licencia(ctx: Contexto = Depends(contexto_empresa)) -> list[dict]:
+    from ..servicios import licencias
+    return licencias.catalogo()
+
+
 routers = [
     r,
     crud.crud_router("marcas", "marcas_asistencia", MarcaIn, filtros=("empleado_id",), campo_fecha="entrada",
@@ -91,7 +98,8 @@ routers = [
                      etiqueta="novedades", estado_pendiente="pendiente"),
     crud.crud_router("incapacidades", "incapacidades", IncapacidadIn, campo_fecha="desde", orden="desde desc",
                      etiqueta="novedades"),
-    crud.crud_router("permisos", "permisos", PermisoIn, campo_fecha="desde", orden="desde desc", etiqueta="novedades"),
+    crud.crud_router("permisos", "permisos", PermisoIn, modelo_upd=PermisoUpd, campo_fecha="desde", orden="desde desc",
+                     etiqueta="novedades"),
     crud.crud_router("vacaciones", "vacaciones", VacacionIn, campo_fecha="desde", orden="creado_en desc",
                      etiqueta="novedades", estado_pendiente="solicitada"),
     crud.crud_router("bonos", "bonos", BonoIn, filtros=("empleado_id",), orden="desde desc", etiqueta="novedades"),

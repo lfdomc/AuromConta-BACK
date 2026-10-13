@@ -44,6 +44,7 @@ from .. import crud
 from ..auth import Contexto, contexto_empresa, operador, requiere_modulo
 from ..fechas import hoy_cr
 from ..servicios import marca, pdf
+from ..servicios.excel_seguro import texto_csv
 
 r = APIRouter(prefix="/empresas/{empresa_id}", tags=["reportes"], dependencies=[Depends(requiere_modulo("planilla"))])
 
@@ -141,6 +142,12 @@ def planillas_reporte(ctx: Contexto, f: Filtros, tipos: tuple[str, ...] = TIPOS_
         (ctx.empresa_id, f.desde, f.hasta, list(tipos))).fetchall()
 
 
+def cotiza_ccss(b: dict) -> bool:
+    """¿Esta boleta se declara a la CCSS y al INS? No, si se calculó como exenta («Exento de CCSS y renta»)
+    o si el colaborador no está asegurado: a esas personas no se les rebaja nada."""
+    return not b.get("b_exento") and b.get("asegurado_ccss") is not False
+
+
 def boletas_de(ctx: Contexto, planillas: list[dict], f: Filtros | None = None) -> list[dict]:
     if not planillas:
         return []
@@ -148,6 +155,8 @@ def boletas_de(ctx: Contexto, planillas: list[dict], f: Filtros | None = None) -
                   e.sucursal_id as emp_sucursal_id, coalesce(s.nombre, 'Sin sucursal') as sucursal,
                   e.iban, e.banco, e.telefono, e.correo, e.clase_riesgo_ins as emp_clase, e.medio_tiempo,
                   e.por_asistencia, e.puesto, e.hijos, e.conyuge, e.asegurado_ccss, e.numero_ccss, h.jornada,
+                  coalesce((b.entrada->'empleado'->>'exento')::boolean, false) as b_exento,
+                  coalesce((b.entrada->>'rebajo_renta')::numeric, 0) as b_rebajo, e.num_empleadores,
                   p.desde as p_desde, p.hasta as p_hasta, p.tipo as p_tipo, p.estado as p_estado,
                   p.fecha_pago as p_fecha_pago
              from boletas b join planillas p on p.id = b.planilla_id
@@ -344,9 +353,8 @@ def rep_ccss(ctx: Contexto, f: Filtros) -> dict:
     """Port de planilla.ccss.report (get_report_data): base cotizable y cuotas reales de cada boleta."""
     pls = planillas_reporte(ctx, f, TIPOS_COTIZABLES)
     filas = []
-    for x in por_empleado(boletas_de(ctx, pls, f), ["base_cotizable", "base_ccss", "ccss_obrero", "ccss_patronal"]):
-        if x.get("asegurado_ccss") is False:      # no asegurados no se reportan a la CCSS (planilla SP de Odoo)
-            continue
+    cotizan = [b for b in boletas_de(ctx, pls, f) if cotiza_ccss(b)]
+    for x in por_empleado(cotizan, ["base_cotizable", "base_ccss", "ccss_obrero", "ccss_patronal"]):
         filas.append({**x, "empleado": nombre_completo(x), "total_cuota": x["ccss_obrero"] + x["ccss_patronal"]})
     par = parametros_vigentes(ctx, f.hasta)
     tasas = (f"Tasa obrero {dec(par.get('ccss_obrero', 0)) * 100:.2f} % · tasa patronal "
@@ -390,7 +398,8 @@ def rep_ins(ctx: Contexto, f: Filtros) -> dict:
     clase_emp = empresa(ctx)["clase_riesgo_ins"] or "II"
     tasas = parametros_vigentes(ctx, f.hasta).get("ins_tasas", {})
     filas = []
-    for i, x in enumerate(por_empleado(boletas_de(ctx, pls, f), ["base_cotizable", "ins_patronal"]), 1):
+    asegurados = [b for b in boletas_de(ctx, pls, f) if cotiza_ccss(b)]
+    for i, x in enumerate(por_empleado(asegurados, ["base_cotizable", "ins_patronal"]), 1):
         a1, a2 = _partir_apellidos(x["apellidos"])
         clase = x["emp_clase"] or clase_emp
         filas.append({"n": i, "nombre": x["nombre"], "apellido1": a1, "apellido2": a2,
@@ -419,6 +428,50 @@ def rep_renta(ctx: Contexto, f: Filtros) -> dict:
             C("base_cotizable", "Base del impuesto", "dinero"), C("creditos_renta", "Créditos fiscales", "dinero"),
             C("renta", "Impuesto retenido", "dinero")]
     return reporte("Impuesto al salario retenido", subtitulo(ctx, f, pls), cols, filas)
+
+
+TIPO_ID_HACIENDA = {"cedula": "Física nacional", "dimex": "DIMEX", "nite": "NITE", "pasaporte": "Extranjero sin DIMEX",
+                    "otro": "Otro"}
+
+
+def rep_retenciones_208(ctx: Contexto, f: Filtros) -> dict:
+    """Formulario 208 (informativa de retenciones sobre salarios, persona jurídica) y total del 138
+    (autoliquidativa) en TRIBU-CR, como planilla.reporte.208.wizard de Odoo. Se presentan cada mes,
+    dentro de los primeros 15 días naturales del mes siguiente (Art. 23 LISR)."""
+    pls = planillas_reporte(ctx, f, TIPOS_COTIZABLES)
+    cfg = ctx.conn.execute("select base_renta from configuracion_planilla where empresa_id = %s",
+                           (ctx.empresa_id,)).fetchone() or {}
+    neto_ccss = cfg.get("base_renta") == "net_ccss"
+    filas = []
+    for x in por_empleado(boletas_de(ctx, pls, f), ["bruto", "base_cotizable", "ccss_obrero", "creditos_renta", "renta",
+                                                    "b_rebajo"]):
+        multi = (x.get("num_empleadores") or 1) > 1
+        if x.get("b_exento"):
+            condicion = "Exento"
+        elif multi:
+            condicion = "Multiempleo con rebajo" if x["b_rebajo"] > 0 else "Multiempleo sin rebajo (revisar)"
+        else:
+            condicion = "Normal"
+        base = max(x["base_cotizable"] - (x["ccss_obrero"] if neto_ccss else CERO), CERO)
+        filas.append({**x, "empleado": nombre_completo(x), "tipo_id": TIPO_ID_HACIENDA.get(x["tipo_identificacion"], "Otro"),
+                      "multi_txt": f"Sí ({x['num_empleadores']} patronos)" if multi else "No", "condicion": condicion,
+                      "base_renta": base, "rebajo": x["b_rebajo"], "total_retenido": x["renta"] + x["b_rebajo"]})
+    filas.sort(key=lambda r: r["empleado"])
+    cols = [C("tipo_id", "Tipo ID"), C("identificacion", "Identificación"), C("empleado", "Nombre"),
+            C("multi_txt", "Multiempleo"), C("condicion", "Condición"), C("bruto", "Salario bruto", "dinero"),
+            C("base_renta", "Base imponible", "dinero"), C("creditos_renta", "Créditos (hijos y cónyuge)", "dinero"),
+            C("renta", "Impuesto", "dinero"), C("rebajo", "Rebajo consolidado", "dinero"),
+            C("total_retenido", "Total retenido", "dinero")]
+    rep_ = reporte("Retenciones sobre salarios · formularios 138 y 208 (TRIBU-CR)", subtitulo(ctx, f, pls), cols, filas)
+    total = rep_["totales"].get("total_retenido", CERO)
+    mes_sig = (f.hasta.replace(day=28) + timedelta(days=4)).replace(day=15)
+    rep_["notas"] = [
+        f"Formulario 138 (autoliquidativa): total a pagar ₡{f'{r2(total):,.2f}'.replace(',', ' ').replace('.', ',')}"
+        f" · {len(filas)} colaborador(es).",
+        "Formulario 208 (informativa): una línea por colaborador con su identificación, salario y retención.",
+        f"Plazo: a más tardar el {fecha_txt(mes_sig)} (primeros 15 días naturales del mes siguiente).",
+        "Base imponible: " + ("salario bruto menos CCSS obrera." if neto_ccss else "salario bruto (Art. 33 LIR).")]
+    return rep_
 
 
 CAMPOS_COSTO = ["bruto", "ccss_patronal", "ins_patronal", "rop_patronal", "prov_aguinaldo", "prov_cesantia",
@@ -656,6 +709,9 @@ REPORTES: dict[str, tuple[str, str, list[str], Callable[[Contexto, Filtros], dic
     "ccss": ("Planilla CCSS", "Salario reportado y cuotas obrero-patronales por colaborador.", FILTROS_PLANILLA, rep_ccss),
     "ins": ("Planilla INS", "Salarios y prima de riesgos del trabajo (formato RT-Virtual).", FILTROS_PLANILLA, rep_ins),
     "renta": ("Impuesto al salario", "Base, créditos fiscales e impuesto retenido.", FILTROS_PLANILLA, rep_renta),
+    "retenciones-208": ("Retenciones 208/138 (TRIBU-CR)",
+                        "Detalle para el formulario 208 y total del 138 de Hacienda, del mes.", FILTROS_PLANILLA,
+                        rep_retenciones_208),
     "costo-patronal": ("Costo patronal", "Cargas sociales y provisiones por colaborador.", FILTROS_PLANILLA,
                        rep_costo_patronal),
     "costo-sucursal": ("Costo por sucursal", "Costo total agrupado por sucursal.", FILTROS_PLANILLA, rep_costo_sucursal),
@@ -773,7 +829,8 @@ def vencimientos(ctx: Contexto, hoy: date) -> list[dict]:
 def _boletas_mes(ctx: Contexto, anio: int, mes: int, sucursal_id: UUID | None = None) -> tuple[date, date, list[dict]]:
     ini, fin = rango_mes(anio, mes)
     pls = planillas_reporte(ctx, Filtros(ini, fin), TIPOS_COTIZABLES)
-    bols = boletas_de(ctx, pls, Filtros(ini, fin, sucursal_id=sucursal_id))
+    # Los exentos y los no asegurados no se declaran a la CCSS ni al INS: no se les rebaja nada.
+    bols = [b for b in boletas_de(ctx, pls, Filtros(ini, fin, sucursal_id=sucursal_id)) if cotiza_ccss(b)]
     if not bols:
         raise HTTPException(409, f"No hay boletas de planillas aprobadas o cerradas en {MESES[mes]} de {anio}")
     return ini, fin, bols
@@ -1227,8 +1284,9 @@ def exportar_asiento(id: UUID, formato: Literal["csv", "xlsx", "pdf"] = "csv",
     w = csv.writer(out, lineterminator="\r\n")
     w.writerow([c["titulo"] for c in cols])
     for l in filas:
-        w.writerow([a["fecha"].isoformat(), l["cuenta_codigo"], l["cuenta_nombre"], l["descripcion"] or "",
-                    l["centro_costo"] or "", f"{r2(l['debito']):.2f}", f"{r2(l['credito']):.2f}"])
+        w.writerow([a["fecha"].isoformat(), texto_csv(l["cuenta_codigo"]), texto_csv(l["cuenta_nombre"]),
+                    texto_csv(l["descripcion"] or ""), texto_csv(l["centro_costo"] or ""),
+                    f"{r2(l['debito']):.2f}", f"{r2(l['credito']):.2f}"])
     # BOM para que Excel abra bien las tildes
     return archivo(out.getvalue().encode("utf-8-sig"), f"{nombre}.csv", "text/csv; charset=utf-8")
 

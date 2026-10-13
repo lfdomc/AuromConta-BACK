@@ -15,6 +15,7 @@ from psycopg import sql
 from psycopg.types.json import Jsonb
 
 from ..db import Conexion
+from . import licencias
 
 FACTOR = {"monthly": Decimal("1"), "biweekly": Decimal("0.5"), "weekly": Decimal("0.25"), "bimonthly": Decimal("2")}
 
@@ -26,6 +27,22 @@ def _solapa(a1: date, a2: date, b1: date, b2: date | None) -> bool:
 def _dias(a1: date, a2: date, b1: date, b2: date) -> int:
     ini, fin = max(a1, b1), min(a2, b2)
     return max((fin - ini).days + 1, 0)
+
+
+def promedio_diario_3_meses(conn: Conexion, empleado_id, antes_de: date, defecto: Decimal) -> Decimal:
+    """Salario promedio diario de los tres meses calendario anteriores (base de la licencia de paternidad y
+    adopción, Art. 95 CT). Sin historial suficiente, el salario diario actual."""
+    ini = (antes_de.replace(day=1) - timedelta(days=1)).replace(day=1)
+    for _ in range(2):
+        ini = (ini - timedelta(days=1)).replace(day=1)
+    fin = antes_de.replace(day=1) - timedelta(days=1)
+    fila = conn.execute("""select count(distinct date_trunc('month', p.hasta)) as meses, coalesce(sum(b.bruto), 0) as total
+                             from boletas b join planillas p on p.id = b.planilla_id
+                            where b.empleado_id = %s and p.tipo = 'ordinaria' and p.estado in ('aprobada','cerrada')
+                              and p.hasta between %s and %s""", (empleado_id, ini, fin)).fetchone()
+    if not fila or fila["meses"] < 3:
+        return defecto
+    return r2(Decimal(fila["total"]) / 3 / 30)
 
 
 def parametros(conn: Conexion, fecha: date) -> M.ParametrosLegales:
@@ -129,10 +146,25 @@ def armar_entrada(conn, pl: dict, emp: dict, cfg: M.ConfigEmpresa) -> tuple[M.En
                              and desde <= %s and hasta >= %s""", (eid, h, d)).fetchall():
         dias = Decimal(_dias(d, h, p["desde"], p["hasta"]))
         total_dias = Decimal((p["hasta"] - p["desde"]).days + 1)
-        dias_ef = min(dias, Decimal(p["dias"])) if total_dias else dias
-        if p["tipo"] == "paternidad" and p["con_goce"]:
-            e.dias_paternidad += int(dias_ef)
-            continue
+        # Los días del permiso se reparten en su rango: una paternidad de 8 días en 4 semanas
+        # cae 4 y 4 en dos quincenas (antes se tomaban los 8 en cada una).
+        dias_ef = (Decimal(p["dias"]) * dias / total_dias).quantize(Decimal("0.01")) if total_dias else dias
+        lic = licencias.tipo(p["tipo"])
+        if lic and lic.pago == "50_50" and p["con_goce"]:
+            # Paternidad y adopción (Art. 95 CT, Ley 10.211): los días de ley no se pagan como salario;
+            # el patrono paga el 50 % del salario promedio de los 3 meses anteriores y la CCSS el otro 50 %.
+            dias_ley = dias_ef * min(Decimal(1), Decimal(lic.dias_ley) / Decimal(p["dias"])) if lic.dias_ley else dias_ef
+            if dias_ley > 0:
+                prom = promedio_diario_3_meses(conn, eid, p["desde"], diario)
+                e.lineas.append(M.Linea("deduccion", M.Categoria.LICENCIA_SIN_GOCE, r2(dias_ley * diario),
+                                        f"{lic.nombre.split(' (')[0]}: {dias_ley.normalize():f} día(s) fuera del salario",
+                                        referencia=str(p["id"])))
+                e.lineas.append(M.Linea("ingreso", M.Categoria.OTRO, r2(dias_ley * prom / 2),
+                                        f"Licencia de {lic.nombre.split(' (')[0].lower()} — 50 % patrono ({lic.base_legal})",
+                                        referencia=str(p["id"])))
+            continue                          # los días por encima de la ley se pagan como salario normal
+        if lic and lic.unidad == "horas" and p["con_goce"]:
+            continue                          # lactancia: la hora diaria se paga dentro del salario
         monto = r2(Decimal(p["monto"]) * dias_ef / Decimal(p["dias"])) if p["monto"] is not None and p["dias"] else r2(dias_ef * diario)
         if p["con_goce"]:
             e.lineas.append(M.Linea("ingreso", M.Categoria.LICENCIA_CON_GOCE, monto, f"Permiso con goce ({p['tipo']})",

@@ -48,6 +48,13 @@ def test_no_asegurado_sin_ccss_ni_renta_y_fuera_del_reporte(client, e):
     rep = client.get(f"/empresas/{eid}/reportes/ccss", params={"planilla_id": pl}, headers=h).json()
     ids = [f["identificacion"] for f in rep["filas"]]
     assert "1-1111-1111" in ids and "2-2222-2222" not in ids
+    # Tampoco va en los archivos oficiales (SICERE, INS)
+    client.patch(f"/empresas/{eid}", json={"numero_patronal": "2-1234-567-001"}, headers=h)
+    sic = client.get(f"/empresas/{eid}/exportaciones/sicere", params={"anio": 2026, "mes": 2}, headers=h)
+    assert sic.status_code == 200, sic.text
+    assert "020111111111" in sic.text and "222222222" not in sic.text
+    ins = client.get(f"/empresas/{eid}/reportes/ins", params={"planilla_id": pl}, headers=h).json()
+    assert [f["identificacion"] for f in ins["filas"]] == ["1-1111-1111"]
 
 
 def test_aguinaldo_con_acumulado_inicial(client, e):

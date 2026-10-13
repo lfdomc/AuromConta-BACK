@@ -989,8 +989,10 @@ def bonos_antiguedad(conn, hoy: date) -> list[dict]:
                extract(year from age(%(h)s::date, e.fecha_ingreso))::int as anios
           from empleados e join empresas em on em.id = e.empresa_id and em.estado_servicio in ('prueba','activo','gracia')
          where e.estado = 'activo' and e.fecha_ingreso < %(h)s
-           and extract(month from e.fecha_ingreso) = extract(month from %(h)s::date)
-           and extract(day from e.fecha_ingreso) = extract(day from %(h)s::date)
+           and (to_char(e.fecha_ingreso, 'MM-DD') = to_char(%(h)s::date, 'MM-DD')
+                -- quien entró un 29 de febrero celebra el 28 en los años no bisiestos
+                or (to_char(e.fecha_ingreso, 'MM-DD') = '02-29' and to_char(%(h)s::date, 'MM-DD') = '02-28'
+                    and extract(day from (date_trunc('year', %(h)s::date) + interval '2 month' - interval '1 day')) = 28))
            and exists (select 1 from bono_antiguedad b where b.empresa_id = e.empresa_id and b.activo)""",
                          {"h": hoy}).fetchall()
     for f in filas:

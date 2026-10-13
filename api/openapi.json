@@ -6953,6 +6953,65 @@
     }
    }
   },
+  "/empresas/{empresa_id}/tipos-licencia": {
+   "get": {
+    "tags": [
+     "novedades",
+     "novedades"
+    ],
+    "summary": "Licencias especiales de ley: base legal, días y quién paga",
+    "operationId": "tipos_licencia_empresas__empresa_id__tipos_licencia_get",
+    "parameters": [
+     {
+      "name": "empresa_id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string",
+       "format": "uuid",
+       "title": "Empresa Id"
+      }
+     },
+     {
+      "name": "authorization",
+      "in": "header",
+      "required": false,
+      "schema": {
+       "type": "string",
+       "default": "",
+       "title": "Authorization"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "Successful Response",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "array",
+         "items": {
+          "type": "object",
+          "additionalProperties": true
+         },
+         "title": "Response Tipos Licencia Empresas  Empresa Id  Tipos Licencia Get"
+        }
+       }
+      }
+     },
+     "422": {
+      "description": "Validation Error",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
   "/empresas/{empresa_id}/marcas": {
    "get": {
     "tags": [
@@ -8263,7 +8322,7 @@
      "content": {
       "application/json": {
        "schema": {
-        "$ref": "#/components/schemas/PermisoInParcial"
+        "$ref": "#/components/schemas/PermisoUpd"
        }
       }
      }
@@ -27250,8 +27309,9 @@
      },
      "tipo": {
       "type": "string",
+      "maxLength": 40,
       "title": "Tipo",
-      "default": "personal"
+      "default": "con_goce"
      },
      "desde": {
       "type": "string",
@@ -27266,7 +27326,9 @@
      "dias": {
       "anyOf": [
        {
-        "type": "number"
+        "type": "number",
+        "maximum": 366.0,
+        "exclusiveMinimum": 0.0
        },
        {
         "type": "string",
@@ -27320,6 +27382,80 @@
       ],
       "title": "Estado",
       "default": "aprobado"
+     },
+     "unidad": {
+      "type": "string",
+      "enum": [
+       "dias",
+       "horas"
+      ],
+      "title": "Unidad",
+      "default": "dias"
+     },
+     "horas": {
+      "anyOf": [
+       {
+        "type": "number",
+        "maximum": 2000.0,
+        "exclusiveMinimum": 0.0
+       },
+       {
+        "type": "string",
+        "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Horas"
+     },
+     "fecha_evento": {
+      "anyOf": [
+       {
+        "type": "string",
+        "format": "date"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Fecha Evento"
+     },
+     "parentesco": {
+      "anyOf": [
+       {
+        "type": "string",
+        "maxLength": 40
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Parentesco"
+     },
+     "pariente": {
+      "anyOf": [
+       {
+        "type": "string",
+        "maxLength": 120
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Pariente"
+     },
+     "numero_documento": {
+      "anyOf": [
+       {
+        "type": "string",
+        "maxLength": 60
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Numero Documento"
      }
     },
     "additionalProperties": false,
@@ -27330,26 +27466,16 @@
      "hasta",
      "dias"
     ],
-    "title": "PermisoIn"
+    "title": "PermisoIn",
+    "description": "Permisos y licencias especiales de ley (paternidad, adopción, duelo, lactancia...)."
    },
-   "PermisoInParcial": {
+   "PermisoUpd": {
     "properties": {
-     "empleado_id": {
-      "anyOf": [
-       {
-        "type": "string",
-        "format": "uuid"
-       },
-       {
-        "type": "null"
-       }
-      ],
-      "title": "Empleado Id"
-     },
      "tipo": {
       "anyOf": [
        {
-        "type": "string"
+        "type": "string",
+        "maxLength": 40
        },
        {
         "type": "null"
@@ -27384,7 +27510,9 @@
      "dias": {
       "anyOf": [
        {
-        "type": "number"
+        "type": "number",
+        "maximum": 366.0,
+        "exclusiveMinimum": 0.0
        },
        {
         "type": "string",
@@ -27459,11 +27587,91 @@
        }
       ],
       "title": "Estado"
+     },
+     "unidad": {
+      "anyOf": [
+       {
+        "type": "string",
+        "enum": [
+         "dias",
+         "horas"
+        ]
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Unidad"
+     },
+     "horas": {
+      "anyOf": [
+       {
+        "type": "number",
+        "maximum": 2000.0,
+        "exclusiveMinimum": 0.0
+       },
+       {
+        "type": "string",
+        "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Horas"
+     },
+     "fecha_evento": {
+      "anyOf": [
+       {
+        "type": "string",
+        "format": "date"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Fecha Evento"
+     },
+     "parentesco": {
+      "anyOf": [
+       {
+        "type": "string",
+        "maxLength": 40
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Parentesco"
+     },
+     "pariente": {
+      "anyOf": [
+       {
+        "type": "string",
+        "maxLength": 120
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Pariente"
+     },
+     "numero_documento": {
+      "anyOf": [
+       {
+        "type": "string",
+        "maxLength": 60
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Numero Documento"
      }
     },
     "additionalProperties": false,
     "type": "object",
-    "title": "PermisoInParcial"
+    "title": "PermisoUpd"
    },
    "PlanillaIn": {
     "properties": {
